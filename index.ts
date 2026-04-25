@@ -55,6 +55,23 @@ interface RuntimeState {
   pendingDynamicPromptContext: boolean;
   lastStaticPromptHash?: string;
   lastDynamicContextHash?: string;
+  lastCacheStatus?: string;
+}
+
+interface UsageLike {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+}
+
+interface AssistantMessageLike {
+  role: "assistant";
+  api?: string;
+  provider?: string;
+  model?: string;
+  usage?: UsageLike;
 }
 
 const state: RuntimeState = {
@@ -63,6 +80,7 @@ const state: RuntimeState = {
   pendingDynamicPromptContext: true,
   lastStaticPromptHash: undefined,
   lastDynamicContextHash: undefined,
+  lastCacheStatus: undefined,
 };
 
 const MAX_HINTS_CHARS = resolveMaxHintsChars();
@@ -80,19 +98,31 @@ const DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS: DynamicLinePattern[] = [
 
 type UiNotifyLevel = "info" | "warning" | "error" | "success";
 let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
+let uiSetStatus: ((key: string, text: string | undefined) => void) | null = null;
 
-function bindUiNotifier(ctx?: ExtensionContext): void {
-  const maybeUi = (ctx as { ui?: { notify?: unknown } } | undefined)?.ui;
+function bindUiControls(ctx?: ExtensionContext): void {
+  const maybeUi = (ctx as { ui?: { notify?: unknown; setStatus?: unknown } } | undefined)?.ui;
   const maybeNotify = maybeUi?.notify;
-  if (typeof maybeNotify !== "function") return;
+  if (typeof maybeNotify === "function") {
+    uiNotify = (message: string, level: UiNotifyLevel = "info") => {
+      try {
+        maybeNotify.call(maybeUi, message, level);
+      } catch {
+        // Keep prompt shaping non-blocking even if UI notification fails.
+      }
+    };
+  }
 
-  uiNotify = (message: string, level: UiNotifyLevel = "info") => {
-    try {
-      maybeNotify.call(maybeUi, message, level);
-    } catch {
-      // Keep prompt shaping non-blocking even if UI notification fails.
-    }
-  };
+  const maybeSetStatus = maybeUi?.setStatus;
+  if (typeof maybeSetStatus === "function") {
+    uiSetStatus = (key: string, text: string | undefined) => {
+      try {
+        maybeSetStatus.call(maybeUi, key, text);
+      } catch {
+        // Keep prompt shaping non-blocking even if footer status updates fail.
+      }
+    };
+  }
 }
 
 function resolveMaxHintsChars(): number {
@@ -328,6 +358,50 @@ function logHintMaterialization(boundary: LifecycleBoundary, resolved: ResolvedH
   }
 }
 
+function formatTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${Math.round(tokens / 100) / 10}k`;
+  return String(tokens);
+}
+
+function isAssistantMessageLike(message: unknown): message is AssistantMessageLike {
+  return Boolean(message && typeof message === "object" && (message as { role?: unknown }).role === "assistant");
+}
+
+function buildCacheStatus(message: AssistantMessageLike): string {
+  const usage = message.usage;
+  if (!usage) return "cache n/a";
+
+  const inputSideTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  if (usage.cacheRead > 0) {
+    const hitRate = inputSideTokens > 0 ? Math.round((usage.cacheRead / inputSideTokens) * 100) : 100;
+    return `cache hit ${hitRate}% R${formatTokenCount(usage.cacheRead)}`;
+  }
+
+  if (usage.cacheWrite > 0) {
+    return `cache warm W${formatTokenCount(usage.cacheWrite)}`;
+  }
+
+  return "cache no-read";
+}
+
+function updateCacheStatus(message: unknown): void {
+  if (!uiSetStatus || !isAssistantMessageLike(message)) return;
+
+  const status = buildCacheStatus(message);
+  if (status === state.lastCacheStatus) return;
+
+  state.lastCacheStatus = status;
+  uiSetStatus(PLUGIN, status);
+
+  logLifecycle("provider_cache_status", {
+    boundary: "message_end",
+    source: "assistant_usage",
+    hash: "n/a",
+    reason: status.replace(/\s+/g, "_"),
+  });
+}
+
 export default async function registerExtension(pi: ExtensionAPI) {
   logLifecycle("factory_registered", {
     reason: "extension_factory_initialized",
@@ -339,7 +413,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
   // Session start: mark the first prompt as needing dynamic context (date/cwd)
   // because those values are stripped out of systemPrompt for cacheability.
   pi.on("session_start", (_event, ctx) => {
-    bindUiNotifier(ctx);
+    bindUiControls(ctx);
     state.skipNextNewSwitchDynamicInjection = true;
     state.agentStartedAfterSessionStart = false;
     state.pendingDynamicPromptContext = true;
@@ -356,10 +430,17 @@ export default async function registerExtension(pi: ExtensionAPI) {
     state.agentStartedAfterSessionStart = true;
   });
 
+  // Provider cache telemetry arrives on the assistant message usage object after
+  // the upstream response completes. Show only what the provider reported.
+  pi.on("message_end", (event: any, ctx) => {
+    bindUiControls(ctx);
+    updateCacheStatus(event.message);
+  });
+
   // Session switch: a new auto-mode unit may rebuild cwd/date in the base prompt.
   // Keep the static system prompt stable and move those changing values to prompt context.
   pi.on("session_switch", (event: any, ctx) => {
-    bindUiNotifier(ctx);
+    bindUiControls(ctx);
     if (event.reason !== "new") {
       logLifecycle("prompt_rebalance_boundary_skip", {
         boundary: "session_switch:new",
@@ -393,7 +474,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
   // Per turn: return a cache-stable systemPrompt and, only at a real session
   // boundary, add a hidden custom prompt message with dynamic values.
   pi.on("before_agent_start", (event: any, ctx) => {
-    bindUiNotifier(ctx);
+    bindUiControls(ctx);
 
     const resolved = resolveHints(ctx.cwd);
     logHintMaterialization("before_agent_start", resolved);

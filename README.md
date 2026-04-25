@@ -85,6 +85,17 @@ Relevant source paths in `../gsd-2`:
 - Length cap: merged hints are capped to `GSD_HINTS_MAX_CHARS` (default `4000`) with truncation notice.
 - Static marker replacement: prior `gsd-hints-injector` system HINTS blocks are removed before appending the latest static HINTS block.
 
+## Cache Status UI
+
+After each assistant response, the extension reads provider-reported `usage.cacheRead` and `usage.cacheWrite` from the completed assistant message and writes a compact footer status via `ctx.ui.setStatus`:
+
+- `cache hit <pct>% R<tokens>` — upstream reported cached input tokens for this response.
+- `cache warm W<tokens>` — upstream reported cache creation/write tokens but no read yet.
+- `cache no-read` — upstream usage was present, but no cached input tokens were reported.
+- `cache n/a` — the response did not include usage telemetry.
+
+This is deliberately based on upstream usage telemetry, not local prompt hashes. Local hashes can show whether the system prompt is stable and cache-friendly, but they cannot prove provider-side cache hits.
+
 ## Diagnostics
 
 Lifecycle diagnostics are emitted as structured JSON with unified fields:
@@ -99,6 +110,7 @@ Important phases:
 - `system_prompt_rebalanced`
 - `dynamic_prompt_context_sent`
 - `dynamic_prompt_context_skip`
+- `provider_cache_status`
 - `hints_source_deduped`
 - `hints_truncated`
 
@@ -111,11 +123,15 @@ node --test index.test.mjs
 # 2) prompt split markers
 rg -n "before_agent_start|SYSTEM_HINTS_START|prompt-dynamic-context|Current date and time|Current working directory" index.ts
 
-# 3) verify HINTS are not sent as visible boundary spam anymore
+# 3) provider cache footer status path is wired from assistant usage
+rg -n "message_end|cache hit|cache warm|cache no-read|provider_cache_status|setStatus" index.ts
+
+# 4) verify HINTS are not sent as visible boundary spam anymore
 rg -n "sendMessage|VISIBLE_HINTS_HEADER|conversation_inject_sent" index.ts && exit 1 || true
 ```
 
 Pass criteria:
 - Each command exits `0`.
 - Step (2) matches the prompt split implementation markers.
-- Step (3) returns no matches (no visible HINTS boundary spam path).
+- Step (3) matches the provider cache status implementation markers.
+- Step (4) returns no matches (no visible HINTS boundary spam path).

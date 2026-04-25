@@ -43,6 +43,18 @@ test("moves dynamic date and cwd lines out of systemPrompt into prompt context",
   assert.match(source, /moved_to_prompt_message/);
 });
 
+test("emits provider cache telemetry to footer status from assistant usage", () => {
+  assert.match(source, /pi\.on\("message_end"/);
+  assert.match(source, /buildCacheStatus/);
+  assert.match(source, /usage\.cacheRead > 0/);
+  assert.match(source, /cache hit/);
+  assert.match(source, /usage\.cacheWrite > 0/);
+  assert.match(source, /cache warm/);
+  assert.match(source, /cache no-read/);
+  assert.match(source, /uiSetStatus\(PLUGIN, status\)/);
+  assert.match(source, /provider_cache_status/);
+});
+
 test("emits structured diagnostics with unified and prompt-split-specific fields", () => {
   assert.match(source, /plugin:\s*PLUGIN/);
   assert.match(source, /phase,/);
@@ -54,4 +66,5 @@ test("emits structured diagnostics with unified and prompt-split-specific fields
   assert.match(source, /hash,/);
   assert.match(source, /system_prompt_rebalanced/);
   assert.match(source, /dynamic_prompt_context_sent/);
+  assert.match(source, /provider_cache_status/);
 });
