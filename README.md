@@ -23,7 +23,21 @@ Priority remains:
 - `session_start` → sends one visible hints message for session boot.
 - `session_switch` (`reason === "new"`) → sends one visible hints message for new auto-mode unit sessions.
   - If a `session_switch:new` immediately follows `session_start` before any agent turn, it is treated as bootstrap duplicate and suppressed once.
-- `before_agent_start` → upserts hints into `systemPrompt` as a strong constraint (append/replace/noop), preventing repeated duplicate blocks.
+- **No `before_agent_start` systemPrompt rewrite** → avoids per-user-turn prompt mutation.
+
+## 设计原则（Session-Boundary Injection）
+
+1. **会话边界优先，不按用户轮次注入**
+   - 仅在 `session_start` 与 `session_switch:new` 注入。
+   - 不使用 `before_agent_start` 做每轮 system prompt 改写。
+
+2. **兼容 auto mode 的“新单元=新会话”语义**
+   - 每个新的 auto unit 会话都能获得一次提示注入。
+   - 启动期 `session_start -> session_switch:new` 的紧邻重复会被抑制一次，避免双注入。
+
+3. **可预测、可审计、可回放**
+   - 注入判定走 `boundary + session + hash` 去重。
+   - 所有关键分支都输出统一结构化诊断字段（`plugin/phase/retryType/attempt/reason` + `boundary/source/hash`）。
 
 ## Dedupe + Length Cap
 
@@ -44,12 +58,12 @@ This makes hint injection decisions replayable and auditable across session life
 
 Pair this with `gsd-auto-continue/README.md`'s lifecycle matrix when running S03 integration.
 
-| Path | Visible Hint Behavior (`session_start` / `session_switch:new`) | `before_agent_start` Behavior | Unified Diagnostic Keywords |
+| Path | Visible Hint Behavior (`session_start` / `session_switch:new`) | SystemPrompt Behavior | Unified Diagnostic Keywords |
 |---|---|---|---|
-| completed | New session emits one visible hints message; immediate bootstrap duplicate switch is suppressed | First turn appends block, later turns noop/replace by hash | `plugin=gsd-hints-injector`, `phase=conversation_inject_sent|conversation_inject_skip`, `reason=bootstrap_duplicate_after_session_start` |
-| blocked (Type3 loop) | No extra visible hint spam unless a real new session boundary occurs | Type3 remediation turns keep one logical hint block via idempotent upsert | `phase=system_prompt_append|system_prompt_replace|system_prompt_noop`, `reason=hints_block_upserted|hints_block_already_current` |
-| manual-stop / cancelled | Stand-down itself does not force visible hint reinjection; non-new switches are skipped | Upsert resumes only when a subsequent agent turn actually starts | `phase=conversation_inject_skip`, `reason=session_switch_non_new|boundary_hash_duplicate` |
-| provider / transient retries | Retry turns in same session should not duplicate visible boundary messages | Prompt block remains single-copy across retries (append once, then noop/replace as needed) | `phase=system_prompt_append|system_prompt_noop|system_prompt_replace`, shared keys `plugin/phase/retryType/attempt/reason` |
+| completed | New session emits one visible hints message; immediate bootstrap duplicate switch is suppressed | No per-turn systemPrompt mutation | `plugin=gsd-hints-injector`, `phase=conversation_inject_sent|conversation_inject_skip`, `reason=bootstrap_duplicate_after_session_start` |
+| blocked (Type3 loop) | No extra visible hint spam unless a real new session boundary occurs | No per-turn systemPrompt mutation | `phase=conversation_inject_sent|conversation_inject_skip`, shared keys `plugin/phase/retryType/attempt/reason` |
+| manual-stop / cancelled | Stand-down itself does not force visible hint reinjection; non-new switches are skipped | No per-turn systemPrompt mutation | `phase=conversation_inject_skip`, `reason=session_switch_non_new|boundary_hash_duplicate` |
+| provider / transient retries | Retry turns in same session should not duplicate visible boundary messages | No per-turn systemPrompt mutation | `phase=conversation_inject_sent|conversation_inject_skip`, shared keys `plugin/phase/retryType/attempt/reason` |
 
 ## Re-runnable Verification Steps (Hints + Lifecycle Contract)
 
@@ -58,10 +72,10 @@ Pair this with `gsd-auto-continue/README.md`'s lifecycle matrix when running S03
 node --test gsd-hints-injector/index.test.mjs
 
 # 2) boundary + suppression markers
-rg -n "session_start|session_switch|before_agent_start|bootstrap_duplicate_after_session_start|boundary_hash_duplicate|session_switch_non_new|conversation_inject_skip" gsd-hints-injector/index.ts
+rg -n "session_start|session_switch|agent_start|bootstrap_duplicate_after_session_start|boundary_hash_duplicate|session_switch_non_new|conversation_inject_skip" gsd-hints-injector/index.ts
 
-# 3) systemPrompt idempotent upsert markers
-rg -n "upsertSystemPromptHints|SYSTEM_HINTS_BLOCK_RE|system_prompt_(append|replace|noop)" gsd-hints-injector/index.ts
+# 3) verify no per-turn systemPrompt injection
+rg -n "before_agent_start|upsertSystemPromptHints|SYSTEM_HINTS_START|system_prompt_" gsd-hints-injector/index.ts && exit 1 || true
 
 # 4) shared observability keys across recovery + hints
 rg -n "plugin:\s*PLUGIN|phase,|retryType,|attempt,|reason," gsd-auto-continue/index.ts gsd-hints-injector/index.ts
@@ -69,5 +83,6 @@ rg -n "plugin:\s*PLUGIN|phase,|retryType,|attempt,|reason," gsd-auto-continue/in
 
 Pass criteria:
 - Each command exits `0`.
-- Step (2) and step (3) match all suppression/upsert markers.
+- Step (2) matches all boundary/suppression markers.
+- Step (3) returns no matches (no per-turn systemPrompt injection path).
 - Step (4) confirms the shared diagnostics envelope required by the S02 verification rule.

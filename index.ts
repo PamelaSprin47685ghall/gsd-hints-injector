@@ -11,15 +11,8 @@ const MAX_TRACKED_BOUNDARY_KEYS = 32;
 const VISIBLE_HINTS_HEADER =
   "**System Auto-Injected HINTS:**\n\nPlease adhere to the following hints for this session:\n\n";
 
-const SYSTEM_HINTS_START = "[USER-DEFINED HINTS — CRITICAL: ADHERE TO THESE RULES]";
-const SYSTEM_HINTS_END = "[/USER-DEFINED HINTS]";
-const SYSTEM_HINTS_BLOCK_RE = new RegExp(
-  `${escapeRegExp(SYSTEM_HINTS_START)}[\\s\\S]*?${escapeRegExp(SYSTEM_HINTS_END)}`,
-  "m",
-);
-
 type HintSource = "global" | "project";
-type LifecycleBoundary = "session_start" | "session_switch:new" | "before_agent_start";
+type LifecycleBoundary = "session_start" | "session_switch:new";
 
 interface HintSegment {
   source: HintSource;
@@ -40,26 +33,38 @@ interface ResolvedHints {
 
 interface RuntimeState {
   skipNextNewSwitchVisibleInjection: boolean;
-  beforeAgentSeenAfterSessionStart: boolean;
+  agentStartedAfterSessionStart: boolean;
   seenConversationKeys: string[];
   seenConversationKeySet: Set<string>;
   lastConversationKey?: string;
 }
 
-interface PromptUpsertResult {
-  systemPrompt: string;
-  action: "append" | "replace" | "noop";
-}
-
 const state: RuntimeState = {
   skipNextNewSwitchVisibleInjection: false,
-  beforeAgentSeenAfterSessionStart: false,
+  agentStartedAfterSessionStart: false,
   seenConversationKeys: [],
   seenConversationKeySet: new Set<string>(),
   lastConversationKey: undefined,
 };
 
 const MAX_HINTS_CHARS = resolveMaxHintsChars();
+
+type UiNotifyLevel = "info" | "warning" | "error" | "success";
+let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
+
+function bindUiNotifier(ctx?: ExtensionContext): void {
+  const maybeUi = (ctx as { ui?: { notify?: unknown } } | undefined)?.ui;
+  const maybeNotify = maybeUi?.notify;
+  if (typeof maybeNotify !== "function") return;
+
+  uiNotify = (message: string, level: UiNotifyLevel = "info") => {
+    try {
+      maybeNotify.call(maybeUi, message, level);
+    } catch {
+      // Keep hint injection non-blocking even if UI notification fails.
+    }
+  };
+}
 
 function resolveMaxHintsChars(): number {
   const raw = Number(process.env.GSD_HINTS_MAX_CHARS ?? "");
@@ -80,10 +85,6 @@ function hashText(input: string): string {
 
 function normalizeContent(input: string): string {
   return input.replace(/\r\n?/g, "\n").trim();
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function getStringField(record: Record<string, unknown>, key: string): string | undefined {
@@ -141,7 +142,8 @@ function logLifecycle(
 
   if (detail) payload.detail = truncate(detail, 500);
 
-  console.log(`[HintsInjector] ${JSON.stringify(payload)}`);
+  if (!uiNotify) return;
+  uiNotify(`[HintsInjector] ${JSON.stringify(payload)}`, "info");
 }
 
 function readHintFile(path: string): string {
@@ -260,39 +262,6 @@ function rememberConversationBoundaryKey(key: string): boolean {
   return true;
 }
 
-function buildSystemHintsBlock(hintsText: string, hash: string): string {
-  return `${SYSTEM_HINTS_START} hash=${hash}\n\n${hintsText}\n\n${SYSTEM_HINTS_END}`;
-}
-
-function upsertSystemPromptHints(systemPrompt: string, hintsBlock: string): PromptUpsertResult {
-  if (!systemPrompt) {
-    return {
-      systemPrompt: hintsBlock,
-      action: "append",
-    };
-  }
-
-  const existing = systemPrompt.match(SYSTEM_HINTS_BLOCK_RE)?.[0];
-  if (!existing) {
-    return {
-      systemPrompt: `${systemPrompt}\n\n${hintsBlock}`,
-      action: "append",
-    };
-  }
-
-  if (existing === hintsBlock) {
-    return {
-      systemPrompt,
-      action: "noop",
-    };
-  }
-
-  return {
-    systemPrompt: systemPrompt.replace(SYSTEM_HINTS_BLOCK_RE, hintsBlock),
-    action: "replace",
-  };
-}
-
 function logHintMaterialization(boundary: LifecycleBoundary, resolved: ResolvedHints): void {
   if (resolved.dedupedSources.length > 0) {
     logLifecycle("hints_source_deduped", {
@@ -375,16 +344,24 @@ export default async function registerExtension(pi: ExtensionAPI) {
 
   // Session start: inject once for interactive session boot / clear.
   pi.on("session_start", (event, ctx) => {
+    bindUiNotifier(ctx);
     state.skipNextNewSwitchVisibleInjection = true;
-    state.beforeAgentSeenAfterSessionStart = false;
+    state.agentStartedAfterSessionStart = false;
 
     injectVisibleHints(pi, "session_start", event, ctx);
+  });
+
+  // Mark that the session has started running agent turns.
+  // Used to avoid suppressing legitimate later session_switch:new boundaries.
+  pi.on("agent_start", () => {
+    state.agentStartedAfterSessionStart = true;
   });
 
   // Session switch: inject for new auto-mode unit sessions only.
   // If a new switch immediately follows session_start before any agent turn,
   // treat it as bootstrap duplicate and suppress one visible message.
   pi.on("session_switch", (event: any, ctx) => {
+    bindUiNotifier(ctx);
     if (event.reason !== "new") {
       logLifecycle("conversation_inject_skip", {
         boundary: "session_switch:new",
@@ -396,7 +373,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (state.skipNextNewSwitchVisibleInjection && !state.beforeAgentSeenAfterSessionStart) {
+    if (state.skipNextNewSwitchVisibleInjection && !state.agentStartedAfterSessionStart) {
       state.skipNextNewSwitchVisibleInjection = false;
       logLifecycle("conversation_inject_skip", {
         boundary: "session_switch:new",
@@ -409,52 +386,5 @@ export default async function registerExtension(pi: ExtensionAPI) {
 
     state.skipNextNewSwitchVisibleInjection = false;
     injectVisibleHints(pi, "session_switch:new", event, ctx);
-  });
-
-  /**
-   * Strong-constraint injection:
-   * ensure hints are present in systemPrompt at before_agent_start boundary,
-   * but upsert idempotently (append/replace/noop) to avoid duplicated blocks.
-   */
-  pi.on("before_agent_start", async (event, ctx) => {
-    state.beforeAgentSeenAfterSessionStart = true;
-
-    const boundary: LifecycleBoundary = "before_agent_start";
-    const resolved = resolveHints(ctx.cwd);
-
-    if (!resolved.text) {
-      logLifecycle("system_prompt_skip", {
-        boundary,
-        source: "none",
-        hash: "none",
-        reason: "no_hints_found",
-      });
-      return;
-    }
-
-    logHintMaterialization(boundary, resolved);
-
-    const currentSystemPrompt = String(event.systemPrompt || "");
-    const hintsBlock = buildSystemHintsBlock(resolved.text, resolved.hash);
-    const upsertResult = upsertSystemPromptHints(currentSystemPrompt, hintsBlock);
-
-    logLifecycle(`system_prompt_${upsertResult.action}`, {
-      boundary,
-      source: resolved.source,
-      hash: resolved.hash,
-      reason:
-        upsertResult.action === "noop"
-          ? "hints_block_already_current"
-          : "hints_block_upserted",
-      detail: `chars=${resolved.finalLength}/${resolved.rawLength}`,
-    });
-
-    if (upsertResult.action === "noop") {
-      return;
-    }
-
-    return {
-      systemPrompt: upsertResult.systemPrompt,
-    };
   });
 }

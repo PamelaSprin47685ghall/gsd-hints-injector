@@ -4,15 +4,16 @@ import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 
-test("registers lifecycle boundaries for session_start/session_switch/before_agent_start", () => {
+test("registers lifecycle boundaries for session_start/session_switch/agent_start", () => {
   assert.match(source, /pi\.on\("session_start"/);
   assert.match(source, /pi\.on\("session_switch"/);
-  assert.match(source, /pi\.on\("before_agent_start"/);
+  assert.match(source, /pi\.on\("agent_start"/);
 });
 
 test("gates session_switch injection to reason=new with bootstrap duplicate suppression", () => {
   assert.match(source, /if \(event\.reason !== "new"\)/);
   assert.match(source, /skipNextNewSwitchVisibleInjection/);
+  assert.match(source, /agentStartedAfterSessionStart/);
   assert.match(source, /bootstrap_duplicate_after_session_start/);
 });
 
@@ -24,11 +25,10 @@ test("implements hints dedupe and size cap controls", () => {
   assert.match(source, /Hints truncated:/);
 });
 
-test("uses idempotent systemPrompt upsert with append\/replace\/noop actions", () => {
-  assert.match(source, /const SYSTEM_HINTS_BLOCK_RE = new RegExp/);
-  assert.match(source, /function upsertSystemPromptHints\(/);
-  assert.match(source, /action: "append" \| "replace" \| "noop"/);
-  assert.match(source, /system_prompt_\$\{upsertResult\.action\}/);
+test("does not modify systemPrompt on every user turn", () => {
+  assert.equal(source.includes('pi.on("before_agent_start"'), false);
+  assert.equal(source.includes("upsertSystemPromptHints"), false);
+  assert.equal(source.includes("SYSTEM_HINTS_START"), false);
 });
 
 test("emits structured diagnostics with unified and hints-specific fields", () => {
