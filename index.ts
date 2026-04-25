@@ -6,13 +6,20 @@ import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 
 const PLUGIN = "gsd-hints-injector";
 const DEFAULT_MAX_HINTS_CHARS = 4000;
-const MAX_TRACKED_BOUNDARY_KEYS = 32;
 
-const VISIBLE_HINTS_HEADER =
-  "**System Auto-Injected HINTS:**\n\nPlease adhere to the following hints for this session:\n\n";
+const SYSTEM_HINTS_START = "<!-- gsd-hints-injector:system-hints:start -->";
+const SYSTEM_HINTS_END = "<!-- gsd-hints-injector:system-hints:end -->";
+
+const STATIC_HINTS_SYSTEM_HEADER = `# System Auto-Injected HINTS
+
+The following HINTS are stable user/project guidance. Treat them as system-level instructions for this session and prefer them over ad-hoc defaults when they apply.`;
+
+const DYNAMIC_CONTEXT_MESSAGE_HEADER = `Prompt Dynamic Context
+
+The following values were intentionally moved out of systemPrompt so provider-side system prompt caching can reuse the stable instructions.`;
 
 type HintSource = "global" | "project";
-type LifecycleBoundary = "session_start" | "session_switch:new";
+type LifecycleBoundary = "session_start" | "session_switch:new" | "before_agent_start";
 
 interface HintSegment {
   source: HintSource;
@@ -31,23 +38,45 @@ interface ResolvedHints {
   dedupedSources: HintSource[];
 }
 
+interface DynamicLinePattern {
+  key: "date_time" | "working_directory";
+  pattern: RegExp;
+}
+
+interface SystemPromptSplit {
+  staticSystemPrompt: string;
+  dynamicContext: string;
+  removedDynamicKeys: string[];
+}
+
 interface RuntimeState {
-  skipNextNewSwitchVisibleInjection: boolean;
+  skipNextNewSwitchDynamicInjection: boolean;
   agentStartedAfterSessionStart: boolean;
-  seenConversationKeys: string[];
-  seenConversationKeySet: Set<string>;
-  lastConversationKey?: string;
+  pendingDynamicPromptContext: boolean;
+  lastStaticPromptHash?: string;
+  lastDynamicContextHash?: string;
 }
 
 const state: RuntimeState = {
-  skipNextNewSwitchVisibleInjection: false,
+  skipNextNewSwitchDynamicInjection: false,
   agentStartedAfterSessionStart: false,
-  seenConversationKeys: [],
-  seenConversationKeySet: new Set<string>(),
-  lastConversationKey: undefined,
+  pendingDynamicPromptContext: true,
+  lastStaticPromptHash: undefined,
+  lastDynamicContextHash: undefined,
 };
 
 const MAX_HINTS_CHARS = resolveMaxHintsChars();
+
+const DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS: DynamicLinePattern[] = [
+  {
+    key: "date_time",
+    pattern: /^Current date and time:\s+.+$/,
+  },
+  {
+    key: "working_directory",
+    pattern: /^Current working directory:\s+.+$/,
+  },
+];
 
 type UiNotifyLevel = "info" | "warning" | "error" | "success";
 let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
@@ -61,7 +90,7 @@ function bindUiNotifier(ctx?: ExtensionContext): void {
     try {
       maybeNotify.call(maybeUi, message, level);
     } catch {
-      // Keep hint injection non-blocking even if UI notification fails.
+      // Keep prompt shaping non-blocking even if UI notification fails.
     }
   };
 }
@@ -85,28 +114,6 @@ function hashText(input: string): string {
 
 function normalizeContent(input: string): string {
   return input.replace(/\r\n?/g, "\n").trim();
-}
-
-function getStringField(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function boundaryId(boundary: LifecycleBoundary, event: unknown): string {
-  const record = (event || {}) as Record<string, unknown>;
-  const sessionRef =
-    getStringField(record, "sessionId") ||
-    getStringField(record, "sessionFile") ||
-    getStringField(record, "newSessionId") ||
-    getStringField(record, "nextSessionId") ||
-    getStringField(record, "toSessionId") ||
-    getStringField(record, "to") ||
-    getStringField(record, "id") ||
-    "unknown";
-
-  return `${boundary}:${sessionRef}`;
 }
 
 function logLifecycle(
@@ -244,22 +251,60 @@ function resolveHints(projectRoot: string): ResolvedHints {
   };
 }
 
-function rememberConversationBoundaryKey(key: string): boolean {
-  if (state.seenConversationKeySet.has(key)) {
-    return false;
-  }
+function removeExistingStaticHints(systemPrompt: string): string {
+  const start = escapeRegExp(SYSTEM_HINTS_START);
+  const end = escapeRegExp(SYSTEM_HINTS_END);
+  return systemPrompt.replace(new RegExp(`\\n*${start}[\\s\\S]*?${end}\\n*`, "g"), "\n").trimEnd();
+}
 
-  state.seenConversationKeySet.add(key);
-  state.seenConversationKeys.push(key);
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
-  if (state.seenConversationKeys.length > MAX_TRACKED_BOUNDARY_KEYS) {
-    const oldest = state.seenConversationKeys.shift();
-    if (oldest) {
-      state.seenConversationKeySet.delete(oldest);
+function buildStaticHintsSystemSection(resolved: ResolvedHints): string {
+  if (!resolved.text) return "";
+
+  return `${SYSTEM_HINTS_START}\n${STATIC_HINTS_SYSTEM_HEADER}\n\nSource: ${resolved.source}\nHash: ${resolved.hash}\n\n${resolved.text}\n${SYSTEM_HINTS_END}`;
+}
+
+function splitSystemPromptForCache(systemPrompt: string): SystemPromptSplit {
+  const normalized = systemPrompt.replace(/\r\n?/g, "\n");
+  const staticLines: string[] = [];
+  const dynamicLines: string[] = [];
+  const removedDynamicKeys: string[] = [];
+
+  for (const line of normalized.split("\n")) {
+    const match = DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS.find(({ pattern }) => pattern.test(line.trimEnd()));
+    if (match) {
+      dynamicLines.push(line.trimEnd());
+      if (!removedDynamicKeys.includes(match.key)) {
+        removedDynamicKeys.push(match.key);
+      }
+      continue;
     }
+    staticLines.push(line);
   }
 
-  return true;
+  return {
+    staticSystemPrompt: staticLines.join("\n").replace(/\n{3,}$/g, "\n\n").trimEnd(),
+    dynamicContext: dynamicLines.join("\n").trim(),
+    removedDynamicKeys,
+  };
+}
+
+function applyStaticPromptRebalance(systemPrompt: string, resolved: ResolvedHints): SystemPromptSplit {
+  const split = splitSystemPromptForCache(systemPrompt);
+  const withoutPriorHints = removeExistingStaticHints(split.staticSystemPrompt);
+  const staticHints = buildStaticHintsSystemSection(resolved);
+
+  return {
+    ...split,
+    staticSystemPrompt: staticHints ? `${withoutPriorHints}\n\n${staticHints}`.trimEnd() : withoutPriorHints,
+  };
+}
+
+function buildDynamicContextMessage(dynamicContext: string): string {
+  return `${DYNAMIC_CONTEXT_MESSAGE_HEADER}\n\n${dynamicContext}`;
 }
 
 function logHintMaterialization(boundary: LifecycleBoundary, resolved: ResolvedHints): void {
@@ -283,57 +328,6 @@ function logHintMaterialization(boundary: LifecycleBoundary, resolved: ResolvedH
   }
 }
 
-function injectVisibleHints(
-  pi: ExtensionAPI,
-  boundary: Extract<LifecycleBoundary, "session_start" | "session_switch:new">,
-  event: unknown,
-  ctx: ExtensionContext,
-): void {
-  const resolved = resolveHints(ctx.cwd);
-
-  if (!resolved.text) {
-    logLifecycle("conversation_inject_skip", {
-      boundary,
-      source: "none",
-      hash: "none",
-      reason: "no_hints_found",
-    });
-    return;
-  }
-
-  logHintMaterialization(boundary, resolved);
-
-  const dedupeKey = `${boundaryId(boundary, event)}:${resolved.hash}`;
-  const duplicateBoundary = dedupeKey === state.lastConversationKey || !rememberConversationBoundaryKey(dedupeKey);
-  if (duplicateBoundary) {
-    state.lastConversationKey = dedupeKey;
-    logLifecycle("conversation_inject_skip", {
-      boundary,
-      source: resolved.source,
-      hash: resolved.hash,
-      reason: "boundary_hash_duplicate",
-      detail: dedupeKey,
-    });
-    return;
-  }
-
-  state.lastConversationKey = dedupeKey;
-
-  pi.sendMessage({
-    customType: "hints-injector",
-    content: `${VISIBLE_HINTS_HEADER}${resolved.text}`,
-    display: true,
-  });
-
-  logLifecycle("conversation_inject_sent", {
-    boundary,
-    source: resolved.source,
-    hash: resolved.hash,
-    reason: "visible_hints_sent",
-    detail: `chars=${resolved.finalLength}`,
-  });
-}
-
 export default async function registerExtension(pi: ExtensionAPI) {
   logLifecycle("factory_registered", {
     reason: "extension_factory_initialized",
@@ -342,13 +336,18 @@ export default async function registerExtension(pi: ExtensionAPI) {
     hash: "n/a",
   });
 
-  // Session start: inject once for interactive session boot / clear.
-  pi.on("session_start", (event, ctx) => {
+  // Session start: mark the first prompt as needing dynamic context (date/cwd)
+  // because those values are stripped out of systemPrompt for cacheability.
+  pi.on("session_start", (_event, ctx) => {
     bindUiNotifier(ctx);
-    state.skipNextNewSwitchVisibleInjection = true;
+    state.skipNextNewSwitchDynamicInjection = true;
     state.agentStartedAfterSessionStart = false;
+    state.pendingDynamicPromptContext = true;
 
-    injectVisibleHints(pi, "session_start", event, ctx);
+    logLifecycle("prompt_rebalance_boundary", {
+      boundary: "session_start",
+      reason: "dynamic_context_pending",
+    });
   });
 
   // Mark that the session has started running agent turns.
@@ -357,13 +356,12 @@ export default async function registerExtension(pi: ExtensionAPI) {
     state.agentStartedAfterSessionStart = true;
   });
 
-  // Session switch: inject for new auto-mode unit sessions only.
-  // If a new switch immediately follows session_start before any agent turn,
-  // treat it as bootstrap duplicate and suppress one visible message.
+  // Session switch: a new auto-mode unit may rebuild cwd/date in the base prompt.
+  // Keep the static system prompt stable and move those changing values to prompt context.
   pi.on("session_switch", (event: any, ctx) => {
     bindUiNotifier(ctx);
     if (event.reason !== "new") {
-      logLifecycle("conversation_inject_skip", {
+      logLifecycle("prompt_rebalance_boundary_skip", {
         boundary: "session_switch:new",
         source: "n/a",
         hash: "n/a",
@@ -373,9 +371,9 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (state.skipNextNewSwitchVisibleInjection && !state.agentStartedAfterSessionStart) {
-      state.skipNextNewSwitchVisibleInjection = false;
-      logLifecycle("conversation_inject_skip", {
+    if (state.skipNextNewSwitchDynamicInjection && !state.agentStartedAfterSessionStart) {
+      state.skipNextNewSwitchDynamicInjection = false;
+      logLifecycle("prompt_rebalance_boundary_skip", {
         boundary: "session_switch:new",
         source: "n/a",
         hash: "n/a",
@@ -384,7 +382,75 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
-    state.skipNextNewSwitchVisibleInjection = false;
-    injectVisibleHints(pi, "session_switch:new", event, ctx);
+    state.skipNextNewSwitchDynamicInjection = false;
+    state.pendingDynamicPromptContext = true;
+    logLifecycle("prompt_rebalance_boundary", {
+      boundary: "session_switch:new",
+      reason: "dynamic_context_pending",
+    });
+  });
+
+  // Per turn: return a cache-stable systemPrompt and, only at a real session
+  // boundary, add a hidden custom prompt message with dynamic values.
+  pi.on("before_agent_start", (event: any, ctx) => {
+    bindUiNotifier(ctx);
+
+    const resolved = resolveHints(ctx.cwd);
+    logHintMaterialization("before_agent_start", resolved);
+
+    const split = applyStaticPromptRebalance(event.systemPrompt, resolved);
+    const staticHash = hashText(split.staticSystemPrompt);
+    const dynamicHash = split.dynamicContext ? hashText(split.dynamicContext) : "none";
+
+    if (staticHash !== state.lastStaticPromptHash) {
+      state.lastStaticPromptHash = staticHash;
+      logLifecycle("system_prompt_rebalanced", {
+        boundary: "before_agent_start",
+        source: resolved.source,
+        hash: staticHash,
+        reason: resolved.text ? "static_hints_in_system_prompt" : "dynamic_lines_removed",
+        detail: `removed=${split.removedDynamicKeys.join("+") || "none"};hintsHash=${resolved.hash}`,
+      });
+    }
+
+    const result: { systemPrompt?: string; message?: { customType: string; content: string; display: boolean; details?: unknown } } = {};
+
+    if (split.staticSystemPrompt !== event.systemPrompt) {
+      result.systemPrompt = split.staticSystemPrompt;
+    }
+
+    if (state.pendingDynamicPromptContext && split.dynamicContext) {
+      state.pendingDynamicPromptContext = false;
+      state.lastDynamicContextHash = dynamicHash;
+      result.message = {
+        customType: "prompt-dynamic-context",
+        content: buildDynamicContextMessage(split.dynamicContext),
+        display: false,
+        details: {
+          plugin: PLUGIN,
+          movedFrom: "systemPrompt",
+          dynamicKeys: split.removedDynamicKeys,
+          hash: dynamicHash,
+        },
+      };
+
+      logLifecycle("dynamic_prompt_context_sent", {
+        boundary: "before_agent_start",
+        source: "system_prompt_dynamic_lines",
+        hash: dynamicHash,
+        reason: "moved_to_prompt_message",
+        detail: `keys=${split.removedDynamicKeys.join("+")}`,
+      });
+    } else if (split.dynamicContext) {
+      logLifecycle("dynamic_prompt_context_skip", {
+        boundary: "before_agent_start",
+        source: "system_prompt_dynamic_lines",
+        hash: dynamicHash,
+        reason: "already_sent_for_boundary",
+        detail: `last=${state.lastDynamicContextHash || "none"}`,
+      });
+    }
+
+    return Object.keys(result).length > 0 ? result : undefined;
   });
 }
