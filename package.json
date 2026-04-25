@@ -1,0 +1,17 @@
+{
+  "name": "gsd-hints-injector",
+  "version": "1.0.0",
+  "description": "Injects HINTS.md into every GSD session.",
+  "type": "module",
+  "gsd": {
+    "extension": true
+  },
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@gsd/pi-coding-agent": "*"
+  }
+}

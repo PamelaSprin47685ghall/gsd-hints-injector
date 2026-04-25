@@ -1,0 +1,10 @@
+{
+  "id": "hints-injector",
+  "name": "Hints Injector",
+  "version": "1.0.0",
+  "description": "Appends global and project-level HINTS.md to every session explicitly.",
+  "tier": "community",
+  "requires": {
+    "platform": "any"
+  }
+}
