@@ -19,8 +19,19 @@ const DYNAMIC_CONTEXT_MESSAGE_HEADER = `Prompt Dynamic Context
 
 The following values were intentionally moved out of systemPrompt so provider-side system prompt caching can reuse the stable instructions.`;
 
+const DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS = [
+  {
+    key: "date_time",
+    pattern: /^Current date and time:\s+.+$/,
+  },
+  {
+    key: "working_directory",
+    pattern: /^Current working directory:\s+.+$/,
+  },
+] as const;
+
 type HintSource = "global" | "project";
-type LifecycleBoundary = "session_start" | "session_switch:new" | "session_compact" | "before_agent_start";
+type UiNotifyLevel = "info" | "warning" | "error" | "success";
 
 interface HintSegment {
   source: HintSource;
@@ -39,24 +50,10 @@ interface ResolvedHints {
   dedupedSources: HintSource[];
 }
 
-interface DynamicLinePattern {
-  key: "date_time" | "working_directory";
-  pattern: RegExp;
-}
-
 interface SystemPromptSplit {
   staticSystemPrompt: string;
   dynamicContext: string;
   removedDynamicKeys: string[];
-}
-
-interface RuntimeState {
-  skipNextNewSwitchDynamicInjection: boolean;
-  agentStartedAfterSessionStart: boolean;
-  pendingDynamicPromptContext: boolean;
-  lastStaticPromptHash?: string;
-  lastDynamicContextHash?: string;
-  lastCacheStatus?: string;
 }
 
 interface UsageLike {
@@ -69,9 +66,6 @@ interface UsageLike {
 
 interface AssistantMessageLike {
   role: "assistant";
-  api?: string;
-  provider?: string;
-  model?: string;
   usage?: UsageLike;
 }
 
@@ -91,42 +85,23 @@ interface HostPiAiModule {
   registerApiProvider: (provider: { api: string; stream: HostApiProvider["stream"]; streamSimple: HostApiProvider["streamSimple"] }, sourceId?: string) => void;
 }
 
-const state: RuntimeState = {
-  skipNextNewSwitchDynamicInjection: false,
-  agentStartedAfterSessionStart: false,
-  pendingDynamicPromptContext: true,
-  lastStaticPromptHash: undefined,
-  lastDynamicContextHash: undefined,
-  lastCacheStatus: undefined,
-};
-
 const MAX_HINTS_CHARS = resolveMaxHintsChars();
 
-const DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS: DynamicLinePattern[] = [
-  {
-    key: "date_time",
-    pattern: /^Current date and time:\s+.+$/,
-  },
-  {
-    key: "working_directory",
-    pattern: /^Current working directory:\s+.+$/,
-  },
-];
-
-type UiNotifyLevel = "info" | "warning" | "error" | "success";
+let activeCwd = process.cwd();
 let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
 let uiSetStatus: ((key: string, text: string | undefined) => void) | null = null;
+let lastCacheStatus: string | undefined;
 
-function bindUiControls(ctx?: ExtensionContext): void {
+function bindContext(ctx?: ExtensionContext): void {
+  if (ctx?.cwd) activeCwd = ctx.cwd;
+
   const maybeUi = (ctx as { ui?: { notify?: unknown; setStatus?: unknown } } | undefined)?.ui;
   const maybeNotify = maybeUi?.notify;
   if (typeof maybeNotify === "function") {
     uiNotify = (message: string, level: UiNotifyLevel = "info") => {
       try {
         maybeNotify.call(maybeUi, message, level);
-      } catch {
-        // Keep prompt shaping non-blocking even if UI notification fails.
-      }
+      } catch {}
     };
   }
 
@@ -135,24 +110,18 @@ function bindUiControls(ctx?: ExtensionContext): void {
     uiSetStatus = (key: string, text: string | undefined) => {
       try {
         maybeSetStatus.call(maybeUi, key, text);
-      } catch {
-        // Keep prompt shaping non-blocking even if footer status updates fail.
-      }
+      } catch {}
     };
   }
 }
 
 function resolveMaxHintsChars(): number {
   const raw = Number(process.env.GSD_HINTS_MAX_CHARS ?? "");
-  if (Number.isFinite(raw) && raw >= 500) {
-    return Math.floor(raw);
-  }
-  return DEFAULT_MAX_HINTS_CHARS;
+  return Number.isFinite(raw) && raw >= 500 ? Math.floor(raw) : DEFAULT_MAX_HINTS_CHARS;
 }
 
 function truncate(text: string, max = 320): string {
-  if (text.length <= max) return text;
-  return `${text.slice(0, max - 3)}...`;
+  return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
 }
 
 function hashText(input: string): string {
@@ -171,23 +140,19 @@ function logLifecycle(
     hash = "n/a",
     reason = "n/a",
     detail,
-    attempt = 0,
-    retryType = "none",
   }: {
     boundary?: string;
     source?: string;
     hash?: string;
     reason?: string;
     detail?: string;
-    attempt?: number;
-    retryType?: string;
   } = {},
 ): void {
+  if (!uiNotify) return;
+
   const payload: Record<string, unknown> = {
     plugin: PLUGIN,
     phase,
-    retryType,
-    attempt,
     reason,
     boundary,
     source,
@@ -195,13 +160,12 @@ function logLifecycle(
   };
 
   if (detail) payload.detail = truncate(detail, 500);
-
-  if (!uiNotify) return;
   uiNotify(`[HintsInjector] ${JSON.stringify(payload)}`, "info");
 }
 
 function readHintFile(path: string): string {
   if (!existsSync(path)) return "";
+
   try {
     return normalizeContent(readFileSync(path, "utf-8"));
   } catch {
@@ -210,13 +174,10 @@ function readHintFile(path: string): string {
 }
 
 function capHintLength(content: string, maxChars: number): { text: string; truncated: boolean } {
-  if (content.length <= maxChars) {
-    return { text: content, truncated: false };
-  }
+  if (content.length <= maxChars) return { text: content, truncated: false };
 
   let keepLength = Math.max(0, maxChars - 80);
   let body = content.slice(0, keepLength).trimEnd();
-
   let suffix = `\n\n...[Hints truncated: ${content.length - body.length} chars omitted]`;
 
   while (body.length > 0 && body.length + suffix.length > maxChars) {
@@ -225,17 +186,9 @@ function capHintLength(content: string, maxChars: number): { text: string; trunc
     suffix = `\n\n...[Hints truncated: ${content.length - body.length} chars omitted]`;
   }
 
-  if (body.length + suffix.length > maxChars) {
-    return {
-      text: suffix.slice(0, maxChars),
-      truncated: true,
-    };
-  }
-
-  return {
-    text: `${body}${suffix}`,
-    truncated: true,
-  };
+  return body.length + suffix.length > maxChars
+    ? { text: suffix.slice(0, maxChars), truncated: true }
+    : { text: `${body}${suffix}`, truncated: true };
 }
 
 function resolveHints(projectRoot: string): ResolvedHints {
@@ -262,17 +215,9 @@ function resolveHints(projectRoot: string): ResolvedHints {
   };
 
   pushSegment("global", "Global Hints", readHintFile(globalHintsPath));
+  pushSegment("project", "Project Hints", existsSync(projectHintsGsd) ? readHintFile(projectHintsGsd) : readHintFile(projectHintsRoot));
 
-  const projectContent = existsSync(projectHintsGsd)
-    ? readHintFile(projectHintsGsd)
-    : readHintFile(projectHintsRoot);
-  pushSegment("project", "Project Hints", projectContent);
-
-  const mergedHints = segments
-    .map((segment) => `### ${segment.label}\n\n${segment.content}`)
-    .join("\n\n")
-    .trim();
-
+  const mergedHints = segments.map((segment) => `### ${segment.label}\n\n${segment.content}`).join("\n\n").trim();
   if (!mergedHints) {
     return {
       text: "",
@@ -286,7 +231,6 @@ function resolveHints(projectRoot: string): ResolvedHints {
   }
 
   const capped = capHintLength(mergedHints, MAX_HINTS_CHARS);
-
   return {
     text: capped.text,
     hash: hashText(capped.text),
@@ -298,38 +242,35 @@ function resolveHints(projectRoot: string): ResolvedHints {
   };
 }
 
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function removeExistingStaticHints(systemPrompt: string): string {
   const start = escapeRegExp(SYSTEM_HINTS_START);
   const end = escapeRegExp(SYSTEM_HINTS_END);
   return systemPrompt.replace(new RegExp(`\\n*${start}[\\s\\S]*?${end}\\n*`, "g"), "\n").trimEnd();
 }
 
-function escapeRegExp(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function buildStaticHintsSystemSection(resolved: ResolvedHints): string {
   if (!resolved.text) return "";
-
   return `${SYSTEM_HINTS_START}\n${STATIC_HINTS_SYSTEM_HEADER}\n\nSource: ${resolved.source}\nHash: ${resolved.hash}\n\n${resolved.text}\n${SYSTEM_HINTS_END}`;
 }
 
 function splitSystemPromptForCache(systemPrompt: string): SystemPromptSplit {
-  const normalized = systemPrompt.replace(/\r\n?/g, "\n");
   const staticLines: string[] = [];
   const dynamicLines: string[] = [];
   const removedDynamicKeys: string[] = [];
 
-  for (const line of normalized.split("\n")) {
+  for (const line of systemPrompt.replace(/\r\n?/g, "\n").split("\n")) {
     const match = DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS.find(({ pattern }) => pattern.test(line.trimEnd()));
-    if (match) {
-      dynamicLines.push(line.trimEnd());
-      if (!removedDynamicKeys.includes(match.key)) {
-        removedDynamicKeys.push(match.key);
-      }
+    if (!match) {
+      staticLines.push(line);
       continue;
     }
-    staticLines.push(line);
+
+    dynamicLines.push(line.trimEnd());
+    if (!removedDynamicKeys.includes(match.key)) removedDynamicKeys.push(match.key);
   }
 
   return {
@@ -354,7 +295,7 @@ function buildDynamicContextMessage(dynamicContext: string): string {
   return `${DYNAMIC_CONTEXT_MESSAGE_HEADER}\n\n${dynamicContext}`;
 }
 
-function logHintMaterialization(boundary: LifecycleBoundary, resolved: ResolvedHints): void {
+function logHintMaterialization(boundary: string, resolved: ResolvedHints): void {
   if (resolved.dedupedSources.length > 0) {
     logLifecycle("hints_source_deduped", {
       boundary,
@@ -395,10 +336,7 @@ function buildCacheStatus(message: AssistantMessageLike): string {
     return `cache hit ${hitRate}% R${formatTokenCount(usage.cacheRead)}`;
   }
 
-  if (usage.cacheWrite > 0) {
-    return `cache warm W${formatTokenCount(usage.cacheWrite)}`;
-  }
-
+  if (usage.cacheWrite > 0) return `cache warm W${formatTokenCount(usage.cacheWrite)}`;
   return "cache no-read";
 }
 
@@ -406,15 +344,13 @@ function updateCacheStatus(message: unknown): void {
   if (!uiSetStatus || !isAssistantMessageLike(message)) return;
 
   const status = buildCacheStatus(message);
-  if (status === state.lastCacheStatus) return;
+  if (status === lastCacheStatus) return;
 
-  state.lastCacheStatus = status;
+  lastCacheStatus = status;
   uiSetStatus(PLUGIN, status);
-
   logLifecycle("provider_cache_status", {
     boundary: "message_end",
     source: "assistant_usage",
-    hash: "n/a",
     reason: status.replace(/\s+/g, "_"),
   });
 }
@@ -423,20 +359,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
+function isTextPart(part: unknown): part is Record<string, unknown> & { text: string } {
+  if (!isRecord(part) || typeof part.text !== "string") return false;
+  return part.type === "input_text" || part.type === "text" || part.type === "output_text";
+}
+
 function extractTextContent(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return undefined;
 
-  const text = value
-    .map((part) => {
-      if (!isRecord(part)) return "";
-      const type = part.type;
-      return (type === "input_text" || type === "text") && typeof part.text === "string" ? part.text : "";
-    })
-    .filter(Boolean)
-    .join("\n");
-
+  const text = value.map((part) => (isTextPart(part) ? part.text : "")).filter(Boolean).join("\n");
   return text || undefined;
+}
+
+function replaceTextContent(value: unknown, text: string): unknown {
+  if (typeof value === "string") return text;
+  if (!Array.isArray(value)) return value;
+
+  let replaced = false;
+  return value.map((part) => {
+    if (!isTextPart(part)) return part;
+    if (replaced) return { ...part, text: "" };
+    replaced = true;
+    return { ...part, text };
+  });
 }
 
 function extractStablePromptFromPayload(payload: Record<string, unknown>): string | undefined {
@@ -446,57 +392,174 @@ function extractStablePromptFromPayload(payload: Record<string, unknown>): strin
   const input = payload.input;
   if (!Array.isArray(input)) return undefined;
 
-  const first = input[0];
-  if (!isRecord(first)) return undefined;
-  if (first.role !== "system" && first.role !== "developer") return undefined;
-
-  return extractTextContent(first.content);
+  const first = input.find((item) => isRecord(item) && (item.role === "system" || item.role === "developer"));
+  return isRecord(first) ? extractTextContent(first.content) : undefined;
 }
 
 function buildStablePromptCacheKey(model: ProviderModelLike | undefined, stablePrompt: string): string {
-  const material = [
-    model?.provider || "unknown",
-    model?.api || "unknown",
-    model?.id || "unknown",
-    stablePrompt,
-  ].join("\n");
-  return `gsd-hints-${hashText(material)}`;
+  return `gsd-hints-${hashText([model?.provider || "unknown", model?.api || "unknown", model?.id || "unknown", stablePrompt].join("\n"))}`;
 }
 
-function rebalanceProviderPromptCacheKey(payload: unknown, model: ProviderModelLike | undefined): unknown | undefined {
-  if (!isRecord(payload) || typeof payload.prompt_cache_key !== "string") return undefined;
+function mergeDynamicContexts(contexts: string[]): string {
+  const lines = new Set<string>();
+  for (const context of contexts) {
+    for (const line of context.split("\n")) {
+      const normalized = line.trimEnd();
+      if (normalized) lines.add(normalized);
+    }
+  }
+  return Array.from(lines).join("\n");
+}
 
-  const stablePrompt = extractStablePromptFromPayload(payload);
-  if (!stablePrompt) return undefined;
+function extractDynamicPromptContextFromText(text: string): string | undefined {
+  const headerIndex = text.indexOf(DYNAMIC_CONTEXT_MESSAGE_HEADER);
+  if (headerIndex < 0) return undefined;
 
-  const nextCacheKey = buildStablePromptCacheKey(model, stablePrompt);
-  if (payload.prompt_cache_key === nextCacheKey) return undefined;
+  const afterHeader = text.slice(headerIndex + DYNAMIC_CONTEXT_MESSAGE_HEADER.length);
+  return afterHeader.replace(/\[end system notification\][\s\S]*$/u, "").trim() || undefined;
+}
 
-  logLifecycle("provider_prompt_cache_key_rebalanced", {
-    boundary: "before_provider_request",
-    source: model?.provider || "unknown",
-    hash: hashText(stablePrompt),
-    reason: "stable_system_prompt_key",
-    detail: `api=${model?.api || "unknown"};model=${model?.id || "unknown"}`,
-  });
+function extractDynamicPromptContextFromItem(item: unknown): string | undefined {
+  if (!isRecord(item) || item.role !== "user") return undefined;
 
+  const text = extractTextContent(item.content);
+  if (!text) return undefined;
+
+  return text.includes("[system notification — type: prompt-dynamic-context;") || text.includes(DYNAMIC_CONTEXT_MESSAGE_HEADER)
+    ? extractDynamicPromptContextFromText(text)
+    : undefined;
+}
+
+function buildResponsesDynamicContextItem(dynamicContext: string): Record<string, unknown> {
   return {
-    ...payload,
-    prompt_cache_key: nextCacheKey,
+    role: "user",
+    content: [{ type: "input_text", text: buildDynamicContextMessage(dynamicContext) }],
   };
 }
 
+function containsManagedSystemPrompt(text: string): boolean {
+  return text.includes(SYSTEM_HINTS_START) || DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS.some(({ pattern }) => pattern.test(text));
+}
+
+function buildRuntimeDynamicContext(projectRoot: string): string {
+  const dateTime = new Date().toLocaleString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  });
+
+  return `Current date and time: ${dateTime}\nCurrent working directory: ${projectRoot}`;
+}
+
+function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undefined, projectRoot: string): unknown | undefined {
+  if (!isRecord(payload)) return undefined;
+
+  const resolved = resolveHints(projectRoot);
+  const nextPayload: Record<string, unknown> = { ...payload };
+  const dynamicContexts: string[] = [];
+  let changed = false;
+  let promptMaterialFound = false;
+
+  const shapePromptValue = (value: unknown): unknown => {
+    const text = extractTextContent(value);
+    if (!text || !containsManagedSystemPrompt(text)) return value;
+
+    promptMaterialFound = true;
+    const split = applyStaticPromptRebalance(text, resolved);
+    if (split.dynamicContext) dynamicContexts.push(split.dynamicContext);
+    if (split.staticSystemPrompt === text) return value;
+
+    changed = true;
+    return replaceTextContent(value, split.staticSystemPrompt);
+  };
+
+  if (payload.instructions !== undefined) {
+    nextPayload.instructions = shapePromptValue(payload.instructions);
+  }
+
+  if (Array.isArray(payload.input)) {
+    const input = [...payload.input];
+    let inputChanged = false;
+    const systemIndex = input.findIndex((item) => isRecord(item) && (item.role === "system" || item.role === "developer"));
+
+    if (systemIndex >= 0) {
+      const item = input[systemIndex];
+      if (isRecord(item)) {
+        const shapedContent = shapePromptValue(item.content);
+        if (shapedContent !== item.content) {
+          input[systemIndex] = { ...item, content: shapedContent };
+          inputChanged = true;
+        }
+      }
+    }
+
+    let latestDynamicContextFromInput: string | undefined;
+    const withoutPriorDynamicContext = input.filter((item) => {
+      const dynamicContextFromItem = extractDynamicPromptContextFromItem(item);
+      if (!dynamicContextFromItem) return true;
+
+      latestDynamicContextFromInput = dynamicContextFromItem;
+      inputChanged = true;
+      promptMaterialFound = true;
+      return false;
+    });
+
+    const dynamicContext = latestDynamicContextFromInput || mergeDynamicContexts(dynamicContexts) || (promptMaterialFound ? buildRuntimeDynamicContext(projectRoot) : "");
+    if (dynamicContext) {
+      nextPayload.input = [buildResponsesDynamicContextItem(dynamicContext), ...withoutPriorDynamicContext];
+      changed = true;
+    } else if (inputChanged) {
+      nextPayload.input = withoutPriorDynamicContext;
+      changed = true;
+    }
+  }
+
+  const stablePrompt = extractStablePromptFromPayload(nextPayload);
+  if (typeof payload.prompt_cache_key === "string" && stablePrompt && promptMaterialFound) {
+    const nextCacheKey = buildStablePromptCacheKey(model, stablePrompt);
+    if (payload.prompt_cache_key !== nextCacheKey) {
+      nextPayload.prompt_cache_key = nextCacheKey;
+      changed = true;
+      logLifecycle("provider_prompt_cache_key_rebalanced", {
+        boundary: "before_provider_request",
+        source: model?.provider || "unknown",
+        hash: hashText(stablePrompt),
+        reason: "stable_system_prompt_key",
+        detail: `api=${model?.api || "unknown"};model=${model?.id || "unknown"}`,
+      });
+    }
+  }
+
+  if (changed) {
+    logHintMaterialization("before_provider_request", resolved);
+    logLifecycle("provider_payload_prompt_rebalanced", {
+      boundary: "before_provider_request",
+      source: resolved.source,
+      hash: stablePrompt ? hashText(stablePrompt) : resolved.hash,
+      reason: "actual_outbound_payload_shaped",
+    });
+  }
+
+  return changed ? nextPayload : undefined;
+}
+
+function isResponsesApi(model: ProviderModelLike | undefined): boolean {
+  return model?.api === "openai-responses" || model?.api === "azure-openai-responses" || model?.api === "openai-codex-responses";
+}
+
 function isHostPiAiModule(value: unknown): value is HostPiAiModule {
-  if (!isRecord(value)) return false;
-  return typeof value.getApiProvider === "function" && typeof value.registerApiProvider === "function";
+  return isRecord(value) && typeof value.getApiProvider === "function" && typeof value.registerApiProvider === "function";
 }
 
 function resolveHostPiAiSpecifiers(): string[] {
   const specifiers: string[] = [];
 
-  if (process.env.GSD_HINTS_HOST_PI_AI_PATH) {
-    specifiers.push(process.env.GSD_HINTS_HOST_PI_AI_PATH);
-  }
+  if (process.env.GSD_HINTS_HOST_PI_AI_PATH) specifiers.push(process.env.GSD_HINTS_HOST_PI_AI_PATH);
 
   const entrypoint = process.argv[1];
   if (!entrypoint) return specifiers;
@@ -519,36 +582,33 @@ async function importHostPiAi(): Promise<HostPiAiModule | undefined> {
     try {
       const module = await import(pathToFileURL(specifier).href);
       if (isHostPiAiModule(module)) return module;
-    } catch {
-      // Try the next resolver candidate.
-    }
+    } catch {}
   }
 
   return undefined;
 }
 
-function withPromptCachePayloadRebalancer(options: any, fallbackModel: ProviderModelLike): any {
+function withPromptPayloadShaper(options: any, fallbackModel: ProviderModelLike): any {
   const priorOnPayload = typeof options?.onPayload === "function" ? options.onPayload : undefined;
 
   return {
     ...options,
     onPayload: async (payload: unknown, model: ProviderModelLike | undefined) => {
       const priorPayload = priorOnPayload ? await priorOnPayload(payload, model) : payload;
-      return rebalanceProviderPromptCacheKey(priorPayload, model || fallbackModel) ?? priorPayload;
+      return shapeProviderPayload(priorPayload, model || fallbackModel, activeCwd) ?? priorPayload;
     },
   };
 }
 
-async function installHostProviderPromptCacheWrappers(): Promise<void> {
-  const installed = globalThis as typeof globalThis & { __gsdHintsProviderCacheWrappers?: Map<string, HostApiProvider> };
-  installed.__gsdHintsProviderCacheWrappers ??= new Map<string, HostApiProvider>();
+async function installHostProviderPromptWrappers(): Promise<void> {
+  const globalState = globalThis as typeof globalThis & { __gsdHintsProviderWrappers?: Map<string, HostApiProvider> };
+  globalState.__gsdHintsProviderWrappers ??= new Map<string, HostApiProvider>();
 
   const hostPiAi = await importHostPiAi();
   if (!hostPiAi) {
     logLifecycle("host_provider_registry_unavailable", {
-      boundary: "factory_registered",
+      boundary: "provider_wrapper_install",
       source: "@gsd/pi-ai",
-      hash: "n/a",
       reason: "host_module_resolution_failed",
     });
     return;
@@ -556,156 +616,85 @@ async function installHostProviderPromptCacheWrappers(): Promise<void> {
 
   for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses"]) {
     const provider = hostPiAi.getApiProvider(api);
-    if (provider && installed.__gsdHintsProviderCacheWrappers.get(api) === provider) continue;
-
     if (!provider) {
       logLifecycle("host_provider_registry_skip", {
-        boundary: "factory_registered",
+        boundary: "provider_wrapper_install",
         source: api,
-        hash: "n/a",
         reason: "api_provider_not_registered",
       });
       continue;
     }
 
-    const wrapper = {
-      api,
-      stream: (model: any, context: any, options?: any) =>
-        provider.stream(model, context, withPromptCachePayloadRebalancer(options, model)),
-      streamSimple: (model: any, context: any, options?: any) =>
-        provider.streamSimple(model, context, withPromptCachePayloadRebalancer(options, model)),
-    };
+    if (globalState.__gsdHintsProviderWrappers.get(api) === provider) continue;
 
-    hostPiAi.registerApiProvider(wrapper, `${PLUGIN}:prompt-cache-key`);
+    hostPiAi.registerApiProvider(
+      {
+        api,
+        stream: (model: any, context: any, options?: any) => provider.stream(model, context, withPromptPayloadShaper(options, model)),
+        streamSimple: (model: any, context: any, options?: any) => provider.streamSimple(model, context, withPromptPayloadShaper(options, model)),
+      },
+      `${PLUGIN}:prompt-payload-shaper`,
+    );
 
-    installed.__gsdHintsProviderCacheWrappers.set(api, wrapper);
-    logLifecycle("host_provider_prompt_cache_wrapper_installed", {
-      boundary: "factory_registered",
+    const registeredProvider = hostPiAi.getApiProvider(api);
+    if (registeredProvider) globalState.__gsdHintsProviderWrappers.set(api, registeredProvider);
+
+    logLifecycle("host_provider_prompt_wrapper_installed", {
+      boundary: "provider_wrapper_install",
       source: api,
-      hash: "n/a",
       reason: "api_provider_wrapped",
     });
   }
 }
 
 export default async function registerExtension(pi: ExtensionAPI) {
-  await installHostProviderPromptCacheWrappers();
+  await installHostProviderPromptWrappers();
 
-  logLifecycle("factory_registered", {
-    reason: "extension_factory_initialized",
-    boundary: "session_start",
-    source: "n/a",
-    hash: "n/a",
+  pi.on("session_start", async (_event, ctx) => {
+    bindContext(ctx);
+    await installHostProviderPromptWrappers();
+    logLifecycle("factory_registered", { boundary: "session_start", reason: "extension_ready" });
   });
 
-  // Session start: mark the first prompt as needing dynamic context (date/cwd)
-  // because those values are stripped out of systemPrompt for cacheability.
-  pi.on("session_start", (_event, ctx) => {
-    bindUiControls(ctx);
-    state.skipNextNewSwitchDynamicInjection = true;
-    state.agentStartedAfterSessionStart = false;
-    state.pendingDynamicPromptContext = true;
-
-    logLifecycle("prompt_rebalance_boundary", {
-      boundary: "session_start",
-      reason: "dynamic_context_pending",
-    });
+  pi.on("model_select", async (_event, ctx) => {
+    bindContext(ctx);
+    await installHostProviderPromptWrappers();
   });
 
-  // Mark that the session has started running agent turns.
-  // Used to avoid suppressing legitimate later session_switch:new boundaries.
-  pi.on("agent_start", () => {
-    state.agentStartedAfterSessionStart = true;
-  });
-
-  // Provider cache telemetry arrives on the assistant message usage object after
-  // the upstream response completes. Show only what the provider reported.
   pi.on("message_end", (event: any, ctx) => {
-    bindUiControls(ctx);
+    bindContext(ctx);
     updateCacheStatus(event.message);
   });
 
-  pi.on("before_provider_request", (event: any, ctx) => {
-    bindUiControls(ctx);
-    return rebalanceProviderPromptCacheKey(event.payload, event.model);
+  pi.on("before_provider_request", async (event: any, ctx) => {
+    bindContext(ctx);
+    await installHostProviderPromptWrappers();
+    return shapeProviderPayload(event.payload, event.model, ctx.cwd);
   });
 
-  pi.on("session_compact", (_event, ctx) => {
-    bindUiControls(ctx);
-    state.pendingDynamicPromptContext = true;
-
-    logLifecycle("prompt_rebalance_boundary", {
-      boundary: "session_compact",
-      reason: "dynamic_context_pending_after_compact",
-    });
-  });
-
-  // Session switch: a new auto-mode unit may rebuild cwd/date in the base prompt.
-  // Keep the static system prompt stable and move those changing values to prompt context.
-  pi.on("session_switch", (event: any, ctx) => {
-    bindUiControls(ctx);
-    if (event.reason !== "new") {
-      logLifecycle("prompt_rebalance_boundary_skip", {
-        boundary: "session_switch:new",
-        source: "n/a",
-        hash: "n/a",
-        reason: "session_switch_non_new",
-        detail: String(event.reason || "unknown"),
-      });
-      return;
-    }
-
-    if (state.skipNextNewSwitchDynamicInjection && !state.agentStartedAfterSessionStart) {
-      state.skipNextNewSwitchDynamicInjection = false;
-      logLifecycle("prompt_rebalance_boundary_skip", {
-        boundary: "session_switch:new",
-        source: "n/a",
-        hash: "n/a",
-        reason: "bootstrap_duplicate_after_session_start",
-      });
-      return;
-    }
-
-    state.skipNextNewSwitchDynamicInjection = false;
-    state.pendingDynamicPromptContext = true;
-    logLifecycle("prompt_rebalance_boundary", {
-      boundary: "session_switch:new",
-      reason: "dynamic_context_pending",
-    });
-  });
-
-  // Per turn: return a cache-stable systemPrompt and, only at a real session
-  // boundary, add a hidden custom prompt message with dynamic values.
-  pi.on("before_agent_start", (event: any, ctx) => {
-    bindUiControls(ctx);
+  pi.on("before_agent_start", async (event: any, ctx) => {
+    bindContext(ctx);
+    await installHostProviderPromptWrappers();
 
     const resolved = resolveHints(ctx.cwd);
     logHintMaterialization("before_agent_start", resolved);
 
     const split = applyStaticPromptRebalance(event.systemPrompt, resolved);
-    const staticHash = hashText(split.staticSystemPrompt);
-    const dynamicHash = split.dynamicContext ? hashText(split.dynamicContext) : "none";
+    const result: { systemPrompt?: string; message?: { customType: string; content: string; display: boolean; details?: unknown } } = {};
 
-    if (staticHash !== state.lastStaticPromptHash) {
-      state.lastStaticPromptHash = staticHash;
+    if (split.staticSystemPrompt !== event.systemPrompt) {
+      result.systemPrompt = split.staticSystemPrompt;
       logLifecycle("system_prompt_rebalanced", {
         boundary: "before_agent_start",
         source: resolved.source,
-        hash: staticHash,
+        hash: hashText(split.staticSystemPrompt),
         reason: resolved.text ? "static_hints_in_system_prompt" : "dynamic_lines_removed",
         detail: `removed=${split.removedDynamicKeys.join("+") || "none"};hintsHash=${resolved.hash}`,
       });
     }
 
-    const result: { systemPrompt?: string; message?: { customType: string; content: string; display: boolean; details?: unknown } } = {};
-
-    if (split.staticSystemPrompt !== event.systemPrompt) {
-      result.systemPrompt = split.staticSystemPrompt;
-    }
-
-    if (state.pendingDynamicPromptContext && split.dynamicContext) {
-      state.pendingDynamicPromptContext = false;
-      state.lastDynamicContextHash = dynamicHash;
+    if (split.dynamicContext && !isResponsesApi(ctx.model)) {
+      const dynamicHash = hashText(split.dynamicContext);
       result.message = {
         customType: "prompt-dynamic-context",
         content: buildDynamicContextMessage(split.dynamicContext),
@@ -717,21 +706,11 @@ export default async function registerExtension(pi: ExtensionAPI) {
           hash: dynamicHash,
         },
       };
-
       logLifecycle("dynamic_prompt_context_sent", {
         boundary: "before_agent_start",
         source: "system_prompt_dynamic_lines",
         hash: dynamicHash,
-        reason: "moved_to_prompt_message",
-        detail: `keys=${split.removedDynamicKeys.join("+")}`,
-      });
-    } else if (split.dynamicContext) {
-      logLifecycle("dynamic_prompt_context_skip", {
-        boundary: "before_agent_start",
-        source: "system_prompt_dynamic_lines",
-        hash: dynamicHash,
-        reason: "already_sent_for_boundary",
-        detail: `last=${state.lastDynamicContextHash || "none"}`,
+        reason: "non_responses_provider_prompt_message",
       });
     }
 

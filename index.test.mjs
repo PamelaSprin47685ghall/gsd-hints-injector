@@ -4,34 +4,14 @@ import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 
-test("registers lifecycle boundaries for prompt rebalancing", () => {
-  assert.match(source, /pi\.on\("session_start"/);
-  assert.match(source, /pi\.on\("session_switch"/);
-  assert.match(source, /pi\.on\("agent_start"/);
+test("uses stateless before_agent_start prompt shaping instead of session-boundary pending flags", () => {
   assert.match(source, /pi\.on\("before_agent_start"/);
-  assert.match(source, /pi\.on\("session_compact"/);
-});
-
-test("marks dynamic prompt context pending again after compaction", () => {
-  assert.match(source, /pi\.on\("session_compact"/);
-  assert.match(source, /boundary: "session_compact"/);
-  assert.match(source, /dynamic_context_pending_after_compact/);
-  assert.match(source, /state\.pendingDynamicPromptContext = true/);
-});
-
-test("gates session_switch dynamic context to reason=new with bootstrap duplicate suppression", () => {
-  assert.match(source, /if \(event\.reason !== "new"\)/);
-  assert.match(source, /skipNextNewSwitchDynamicInjection/);
-  assert.match(source, /agentStartedAfterSessionStart/);
-  assert.match(source, /bootstrap_duplicate_after_session_start/);
-});
-
-test("implements hints dedupe and size cap controls", () => {
-  assert.match(source, /const seenContentHashes = new Set<string>\(\)/);
-  assert.match(source, /function capHintLength\(/);
-  assert.match(source, /DEFAULT_MAX_HINTS_CHARS = 4000/);
-  assert.match(source, /GSD_HINTS_MAX_CHARS/);
-  assert.match(source, /Hints truncated:/);
+  assert.doesNotMatch(source, /pendingDynamicPromptContext/);
+  assert.doesNotMatch(source, /skipNextNewSwitchDynamicInjection/);
+  assert.doesNotMatch(source, /agentStartedAfterSessionStart/);
+  assert.doesNotMatch(source, /pi\.on\("session_switch"/);
+  assert.doesNotMatch(source, /pi\.on\("agent_start"/);
+  assert.doesNotMatch(source, /pi\.on\("session_compact"/);
 });
 
 test("moves stable HINTS into systemPrompt with explicit static markers", () => {
@@ -42,13 +22,53 @@ test("moves stable HINTS into systemPrompt with explicit static markers", () => 
   assert.match(source, /static_hints_in_system_prompt/);
 });
 
-test("moves dynamic date and cwd lines out of systemPrompt into prompt context", () => {
+test("moves dynamic date and cwd lines out of systemPrompt", () => {
   assert.match(source, /DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS/);
   assert.match(source, /Current date and time:/);
   assert.match(source, /Current working directory:/);
   assert.match(source, /splitSystemPromptForCache/);
+  assert.match(source, /dynamic_lines_removed/);
+});
+
+test("injects dynamic context at provider payload boundary for Responses APIs", () => {
+  assert.match(source, /function shapeProviderPayload/);
+  assert.match(source, /before_provider_request/);
+  assert.match(source, /buildResponsesDynamicContextItem/);
+  assert.match(source, /extractDynamicPromptContextFromItem/);
+  assert.match(source, /containsManagedSystemPrompt/);
+  assert.match(source, /actual_outbound_payload_shaped/);
+  assert.match(source, /isResponsesApi/);
+});
+
+test("keeps Responses dynamic context at payload boundary and non-Responses via custom messages", () => {
   assert.match(source, /customType: "prompt-dynamic-context"/);
-  assert.match(source, /moved_to_prompt_message/);
+  assert.match(source, /non_responses_provider_prompt_message/);
+  assert.match(source, /!isResponsesApi\(ctx\.model\)/);
+  assert.match(source, /buildRuntimeDynamicContext/);
+  assert.match(source, /promptMaterialFound/);
+});
+
+test("stabilizes OpenAI Responses prompt cache keys from shaped outbound payload", () => {
+  assert.match(source, /prompt_cache_key/);
+  assert.match(source, /extractStablePromptFromPayload/);
+  assert.match(source, /buildStablePromptCacheKey/);
+  assert.match(source, /provider_prompt_cache_key_rebalanced/);
+});
+
+test("wraps host providers idempotently after upstream registry wrapping", () => {
+  assert.match(source, /installHostProviderPromptWrappers/);
+  assert.match(source, /getApiProvider\(api\)/);
+  assert.match(source, /registerApiProvider/);
+  assert.match(source, /const registeredProvider = hostPiAi\.getApiProvider\(api\)/);
+  assert.match(source, /__gsdHintsProviderWrappers\.set\(api, registeredProvider\)/);
+  assert.match(source, /host_provider_prompt_wrapper_installed/);
+});
+
+test("retries wrapper installation at stable lifecycle points", () => {
+  assert.match(source, /pi\.on\("session_start"/);
+  assert.match(source, /pi\.on\("model_select"/);
+  assert.match(source, /pi\.on\("before_provider_request"/);
+  assert.match(source, /pi\.on\("before_agent_start"/);
 });
 
 test("emits provider cache telemetry to footer status from assistant usage", () => {
@@ -63,41 +83,10 @@ test("emits provider cache telemetry to footer status from assistant usage", () 
   assert.match(source, /provider_cache_status/);
 });
 
-test("stabilizes OpenAI Responses prompt cache keys at provider payload boundary", () => {
-  assert.match(source, /pi\.on\("before_provider_request"/);
-  assert.match(source, /rebalanceProviderPromptCacheKey/);
-  assert.match(source, /prompt_cache_key/);
-  assert.match(source, /extractStablePromptFromPayload/);
-  assert.match(source, /buildStablePromptCacheKey/);
-  assert.match(source, /payload\.instructions/);
-  assert.match(source, /first\.role !== "system" && first\.role !== "developer"/);
-  assert.match(source, /provider_prompt_cache_key_rebalanced/);
-});
-
-test("wraps host OpenAI API providers for interactive AgentSession payloads", () => {
-  assert.match(source, /resolveHostPiAiSpecifiers/);
-  assert.match(source, /node_modules", "@gsd", "pi-ai", "dist", "index\.js"/);
-  assert.match(source, /packages", "pi-ai", "dist", "index\.js"/);
-  assert.match(source, /installHostProviderPromptCacheWrappers/);
-  assert.match(source, /getApiProvider\(api\)/);
-  assert.match(source, /registerApiProvider/);
-  assert.match(source, /withPromptCachePayloadRebalancer/);
-  assert.match(source, /openai-responses/);
-  assert.match(source, /azure-openai-responses/);
-  assert.match(source, /openai-codex-responses/);
-  assert.match(source, /host_provider_prompt_cache_wrapper_installed/);
-});
-
-test("emits structured diagnostics with unified and prompt-split-specific fields", () => {
-  assert.match(source, /plugin:\s*PLUGIN/);
-  assert.match(source, /phase,/);
-  assert.match(source, /retryType,/);
-  assert.match(source, /attempt,/);
-  assert.match(source, /reason,/);
-  assert.match(source, /boundary,/);
-  assert.match(source, /source,/);
-  assert.match(source, /hash,/);
-  assert.match(source, /system_prompt_rebalanced/);
-  assert.match(source, /dynamic_prompt_context_sent/);
-  assert.match(source, /provider_cache_status/);
+test("implements hints dedupe and size cap controls", () => {
+  assert.match(source, /const seenContentHashes = new Set<string>\(\)/);
+  assert.match(source, /function capHintLength\(/);
+  assert.match(source, /DEFAULT_MAX_HINTS_CHARS = 4000/);
+  assert.match(source, /GSD_HINTS_MAX_CHARS/);
+  assert.match(source, /Hints truncated:/);
 });
