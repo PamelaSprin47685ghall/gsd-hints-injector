@@ -40,7 +40,7 @@ Priority remains:
 
 These lines are stripped from `systemPrompt` deterministically on every turn. For Responses payloads, the dynamic context is inserted directly into the outbound `input` array immediately before the provider request is sent. Existing stale `prompt-dynamic-context` notification items are removed from that payload first, so the provider sees one fresh dynamic context item.
 
-For non-Responses providers, the same dynamic context is sent as a hidden custom message with `customType: "prompt-dynamic-context"`.
+For non-Responses providers, the same dynamic context is sent as a hidden custom message with `customType: "prompt-dynamic-context"`. The extension only reuses dynamic context that came from GSD's official `systemPrompt`; it does not recreate session time or working-directory lines itself.
 
 ## What the ../gsd-2 analysis found
 
@@ -71,7 +71,8 @@ The plugin now uses a stateless model:
 - `before_provider_request`
   - shapes the actual outbound payload for SDK/headless paths,
   - removes stale/current dynamic context notification carrier items,
-  - inserts one fresh dynamic context item from the latest carrier, the outbound system prompt, or a runtime date/cwd fallback,
+  - inserts one fresh dynamic context item from the latest carrier, the outbound system prompt, or the official `before_agent_start` dynamic-context snapshot,
+  - never fabricates date/cwd values itself, so session-start time remains owned by GSD's system prompt builder,
   - only mutates payloads that already contain GSD-managed prompt material, so internal summarization calls are not polluted,
   - derives `prompt_cache_key` from provider + API + model + stable prompt.
 - Host provider wrapper

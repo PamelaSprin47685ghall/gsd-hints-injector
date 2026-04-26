@@ -88,6 +88,7 @@ interface HostPiAiModule {
 const MAX_HINTS_CHARS = resolveMaxHintsChars();
 
 let activeCwd = process.cwd();
+const officialDynamicContextByCwd = new Map<string, string>();
 let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
 let uiSetStatus: ((key: string, text: string | undefined) => void) | null = null;
 let lastCacheStatus: string | undefined;
@@ -437,23 +438,17 @@ function buildResponsesDynamicContextItem(dynamicContext: string): Record<string
   };
 }
 
-function containsManagedSystemPrompt(text: string): boolean {
-  return text.includes(SYSTEM_HINTS_START) || DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS.some(({ pattern }) => pattern.test(text));
+function rememberOfficialDynamicContext(projectRoot: string, dynamicContext: string): void {
+  const normalized = dynamicContext.trim();
+  if (normalized) officialDynamicContextByCwd.set(projectRoot, normalized);
 }
 
-function buildRuntimeDynamicContext(projectRoot: string): string {
-  const dateTime = new Date().toLocaleString("en-US", {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    timeZoneName: "short",
-  });
+function getOfficialDynamicContext(projectRoot: string): string {
+  return officialDynamicContextByCwd.get(projectRoot) || "";
+}
 
-  return `Current date and time: ${dateTime}\nCurrent working directory: ${projectRoot}`;
+function containsManagedSystemPrompt(text: string): boolean {
+  return text.includes(SYSTEM_HINTS_START) || DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS.some(({ pattern }) => pattern.test(text));
 }
 
 function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undefined, projectRoot: string): unknown | undefined {
@@ -509,7 +504,7 @@ function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undef
       return false;
     });
 
-    const dynamicContext = latestDynamicContextFromInput || mergeDynamicContexts(dynamicContexts) || (promptMaterialFound ? buildRuntimeDynamicContext(projectRoot) : "");
+    const dynamicContext = latestDynamicContextFromInput || mergeDynamicContexts(dynamicContexts) || (promptMaterialFound ? getOfficialDynamicContext(projectRoot) : "");
     if (dynamicContext) {
       nextPayload.input = [buildResponsesDynamicContextItem(dynamicContext), ...withoutPriorDynamicContext];
       changed = true;
@@ -667,6 +662,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     bindContext(ctx);
+    if (ctx.cwd) officialDynamicContextByCwd.delete(ctx.cwd);
     await installHostProviderPromptWrappers();
     logLifecycle("factory_registered", { boundary: "session_start", reason: "extension_ready" });
   });
@@ -695,6 +691,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
     logHintMaterialization("before_agent_start", resolved);
 
     const split = applyStaticPromptRebalance(event.systemPrompt, resolved);
+    rememberOfficialDynamicContext(ctx.cwd, split.dynamicContext);
     const result: { systemPrompt?: string; message?: { customType: string; content: string; display: boolean; details?: unknown } } = {};
 
     if (split.staticSystemPrompt !== event.systemPrompt) {

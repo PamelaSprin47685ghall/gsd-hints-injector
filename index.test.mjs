@@ -44,8 +44,15 @@ test("keeps Responses dynamic context at payload boundary and non-Responses via 
   assert.match(source, /customType: "prompt-dynamic-context"/);
   assert.match(source, /non_responses_provider_prompt_message/);
   assert.match(source, /!isResponsesApi\(ctx\.model\)/);
-  assert.match(source, /buildRuntimeDynamicContext/);
+  assert.match(source, /rememberOfficialDynamicContext/);
+  assert.match(source, /getOfficialDynamicContext/);
   assert.match(source, /promptMaterialFound/);
+});
+
+test("never fabricates runtime prompt dynamic context", () => {
+  assert.doesNotMatch(source, /function buildRuntimeDynamicContext/);
+  assert.doesNotMatch(source, /new Date\(\)/);
+  assert.doesNotMatch(source, /toLocaleString\("en-US"/);
 });
 
 test("stabilizes OpenAI Responses prompt cache keys from shaped outbound payload", () => {
