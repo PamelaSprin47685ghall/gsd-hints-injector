@@ -7,9 +7,6 @@
   "requires": {
     "platform": "any"
   },
-  "dependencies": {
-    "runtime": ["node:crypto", "node:fs", "node:os", "node:path"]
-  },
   "provides": {
     "hooks": ["before_agent_start", "before_provider_request"]
   }
