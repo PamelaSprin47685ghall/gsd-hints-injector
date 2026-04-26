@@ -3,14 +3,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export default function hintsInjector(pi: any): void {
-  pi.on("before_agent_start", (e: any) => buildBeforeAgentStartResult(e.systemPrompt));
+export default function hintsInjector(pi) {
+  pi.on("before_agent_start", (e) => buildBeforeAgentStartResult(e.systemPrompt));
   pi.on("before_provider_request", stabilizeResponsesPayload);
 }
 
-export function buildBeforeAgentStartResult(systemPrompt: string) {
+export function buildBeforeAgentStartResult(systemPrompt) {
   let cwd = "";
-  const dynLines: string[] = [], keptLines: string[] = [];
+  const dynLines = [], keptLines = [];
   
   for (const line of systemPrompt.split("\n")) {
     if (/^Current (date|working directory)/.test(line)) {
@@ -38,12 +38,12 @@ export function buildBeforeAgentStartResult(systemPrompt: string) {
   return { ...(finalSys !== systemPrompt && { systemPrompt: finalSys }), ...(msg && { message: msg }) };
 }
 
-function read(p: string) {
+function read(p) {
   try { return existsSync(p) ? readFileSync(p, "utf8").trim() : ""; } catch { return ""; }
 }
 
-export function loadHintSources(cwd?: string) {
-  const s: any[] = [];
+export function loadHintSources(cwd) {
+  const s = [];
   const gPath = join(process.env.GSD_HOME || join(homedir(), ".gsd"), "HINTS.md");
   const g = read(gPath);
   if (g) s.push({ label: "Global", path: gPath, content: g });
@@ -57,7 +57,7 @@ export function loadHintSources(cwd?: string) {
   return s;
 }
 
-export function stabilizeResponsesPayload(event: any) {
+export function stabilizeResponsesPayload(event) {
   const p = event.payload;
   if (!p || typeof p !== "object" || Array.isArray(p)) return undefined;
   if (!["openai-responses", "azure-openai-responses"].includes(event.model?.api || "") && !(Array.isArray(p.input) && ("prompt_cache_key" in p || "store" in p))) return undefined;
@@ -68,7 +68,7 @@ export function stabilizeResponsesPayload(event: any) {
   const key = process.env.GSD_HINTS_PROMPT_CACHE_KEY?.trim() || (() => {
     if (!Array.isArray(next.input)) return undefined;
     const text = next.input.filter(i => i && typeof i === "object" && (i.role === "system" || i.role === "developer"))
-      .map(i => typeof i.content === "string" ? i.content : Array.isArray(i.content) ? i.content.map((b: any) => b?.text || "").join("\n") : "")
+      .map(i => typeof i.content === "string" ? i.content : Array.isArray(i.content) ? i.content.map((b) => b?.text || "").join("\n") : "")
       .filter(Boolean).join("\n\n");
     return text ? `gsd-hints:${createHash("sha256").update(text).digest("hex").slice(0, 24)}` : undefined;
   })();
@@ -82,11 +82,11 @@ export function stabilizeResponsesPayload(event: any) {
   return changed ? next : undefined;
 }
 
-export function stabilizeResponsesInput(input: any[]) {
+export function stabilizeResponsesInput(input) {
   const callMap = new Map();
   let m = 0, f = 0, changed = false;
   
-  const getCallId = (id: string) => {
+  const getCallId = (id) => {
     if (!callMap.has(id)) callMap.set(id, `call_${callMap.size}`);
     return callMap.get(id);
   };
@@ -94,7 +94,7 @@ export function stabilizeResponsesInput(input: any[]) {
   const next = input.map(i => {
     if (!i || typeof i !== "object") return i;
     let out = i;
-    const upd = (k: string, v: any) => { if (out[k] !== v) { if (out === i) out = { ...i }; out[k] = v; changed = true; } };
+    const upd = (k, v) => { if (out[k] !== v) { if (out === i) out = { ...i }; out[k] = v; changed = true; } };
 
     if (i.type === "message" && i.role === "assistant" && typeof i.id === "string") upd("id", `msg_${m++}`);
     if (i.type === "function_call") {

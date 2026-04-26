@@ -3,16 +3,16 @@
   "version": "1.0.0",
   "description": "Injects HINTS.md into systemPrompt and moves dynamic prompt lines out for cacheability.",
   "type": "module",
-  "exports": "./index.ts",
+  "exports": "./index.js",
   "scripts": {
-    "test": "node --experimental-strip-types --test index.test.mjs"
+    "test": "node --test index.test.mjs"
   },
   "gsd": {
     "extension": true
   },
   "pi": {
     "extensions": [
-      "index.ts"
+      "index.js"
     ]
   }
 }
