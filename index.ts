@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 
@@ -556,31 +556,46 @@ function isHostPiAiModule(value: unknown): value is HostPiAiModule {
   return isRecord(value) && typeof value.getApiProvider === "function" && typeof value.registerApiProvider === "function";
 }
 
+function isUrlSpecifier(specifier: string): boolean {
+  return /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(specifier);
+}
+
+function isPathLikeSpecifier(specifier: string): boolean {
+  return specifier.startsWith("/") || specifier.startsWith("./") || specifier.startsWith("../") || specifier.includes("\\");
+}
+
+function normalizeImportSpecifier(specifier: string): string | undefined {
+  const trimmed = specifier.trim();
+  if (!trimmed) return undefined;
+  if (isUrlSpecifier(trimmed)) return trimmed;
+  if (!isPathLikeSpecifier(trimmed)) return trimmed;
+  if (!existsSync(trimmed)) return undefined;
+  return pathToFileURL(trimmed).href;
+}
+
 function resolveHostPiAiSpecifiers(): string[] {
   const specifiers: string[] = [];
+  const push = (specifier: string | undefined): void => {
+    if (!specifier) return;
+    const normalized = normalizeImportSpecifier(specifier);
+    if (normalized && !specifiers.includes(normalized)) specifiers.push(normalized);
+  };
 
-  if (process.env.GSD_HINTS_HOST_PI_AI_PATH) specifiers.push(process.env.GSD_HINTS_HOST_PI_AI_PATH);
+  push(process.env.GSD_HINTS_HOST_PI_AI_PATH);
 
-  const entrypoint = process.argv[1];
-  if (!entrypoint) return specifiers;
+  try {
+    push(import.meta.resolve("@gsd/pi-ai"));
+  } catch {}
 
-  let current = dirname(entrypoint);
-  for (let depth = 0; depth < 8; depth += 1) {
-    specifiers.push(join(current, "node_modules", "@gsd", "pi-ai", "dist", "index.js"));
-    specifiers.push(join(current, "packages", "pi-ai", "dist", "index.js"));
+  push("@gsd/pi-ai");
 
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-
-  return specifiers.filter((specifier, index, all) => all.indexOf(specifier) === index && existsSync(specifier));
+  return specifiers;
 }
 
 async function importHostPiAi(): Promise<HostPiAiModule | undefined> {
   for (const specifier of resolveHostPiAiSpecifiers()) {
     try {
-      const module = await import(pathToFileURL(specifier).href);
+      const module = await import(specifier);
       if (isHostPiAiModule(module)) return module;
     } catch {}
   }

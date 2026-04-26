@@ -64,6 +64,14 @@ test("wraps host providers idempotently after upstream registry wrapping", () =>
   assert.match(source, /host_provider_prompt_wrapper_installed/);
 });
 
+test("resolves host pi-ai from the runtime resolver instead of argv-derived paths", () => {
+  assert.match(source, /import\.meta\.resolve\("@gsd\/pi-ai"\)/);
+  assert.match(source, /push\("@gsd\/pi-ai"\)/);
+  assert.doesNotMatch(source, /process\.argv/);
+  assert.doesNotMatch(source, /dirname\(entrypoint\)/);
+  assert.doesNotMatch(source, /packages", "pi-ai", "dist", "index\.js"/);
+});
+
 test("retries wrapper installation at stable lifecycle points", () => {
   assert.match(source, /pi\.on\("session_start"/);
   assert.match(source, /pi\.on\("model_select"/);
