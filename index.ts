@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 
 const PLUGIN = "gsd-hints-injector";
@@ -78,6 +79,16 @@ interface ProviderModelLike {
   provider?: string;
   id?: string;
   api?: string;
+}
+
+interface HostApiProvider {
+  stream: (model: any, context: any, options?: any) => any;
+  streamSimple: (model: any, context: any, options?: any) => any;
+}
+
+interface HostPiAiModule {
+  getApiProvider: (api: string) => HostApiProvider | undefined;
+  registerApiProvider: (provider: { api: string; stream: HostApiProvider["stream"]; streamSimple: HostApiProvider["streamSimple"] }, sourceId?: string) => void;
 }
 
 const state: RuntimeState = {
@@ -475,7 +486,111 @@ function rebalanceProviderPromptCacheKey(payload: unknown, model: ProviderModelL
   };
 }
 
+function isHostPiAiModule(value: unknown): value is HostPiAiModule {
+  if (!isRecord(value)) return false;
+  return typeof value.getApiProvider === "function" && typeof value.registerApiProvider === "function";
+}
+
+function resolveHostPiAiSpecifiers(): string[] {
+  const specifiers: string[] = [];
+
+  if (process.env.GSD_HINTS_HOST_PI_AI_PATH) {
+    specifiers.push(process.env.GSD_HINTS_HOST_PI_AI_PATH);
+  }
+
+  const entrypoint = process.argv[1];
+  if (!entrypoint) return specifiers;
+
+  let current = dirname(entrypoint);
+  for (let depth = 0; depth < 8; depth += 1) {
+    specifiers.push(join(current, "node_modules", "@gsd", "pi-ai", "dist", "index.js"));
+    specifiers.push(join(current, "packages", "pi-ai", "dist", "index.js"));
+
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return specifiers.filter((specifier, index, all) => all.indexOf(specifier) === index && existsSync(specifier));
+}
+
+async function importHostPiAi(): Promise<HostPiAiModule | undefined> {
+  for (const specifier of resolveHostPiAiSpecifiers()) {
+    try {
+      const module = await import(pathToFileURL(specifier).href);
+      if (isHostPiAiModule(module)) return module;
+    } catch {
+      // Try the next resolver candidate.
+    }
+  }
+
+  return undefined;
+}
+
+function withPromptCachePayloadRebalancer(options: any, fallbackModel: ProviderModelLike): any {
+  const priorOnPayload = typeof options?.onPayload === "function" ? options.onPayload : undefined;
+
+  return {
+    ...options,
+    onPayload: async (payload: unknown, model: ProviderModelLike | undefined) => {
+      const priorPayload = priorOnPayload ? await priorOnPayload(payload, model) : payload;
+      return rebalanceProviderPromptCacheKey(priorPayload, model || fallbackModel) ?? priorPayload;
+    },
+  };
+}
+
+async function installHostProviderPromptCacheWrappers(): Promise<void> {
+  const installed = globalThis as typeof globalThis & { __gsdHintsProviderCacheWrappers?: Map<string, HostApiProvider> };
+  installed.__gsdHintsProviderCacheWrappers ??= new Map<string, HostApiProvider>();
+
+  const hostPiAi = await importHostPiAi();
+  if (!hostPiAi) {
+    logLifecycle("host_provider_registry_unavailable", {
+      boundary: "factory_registered",
+      source: "@gsd/pi-ai",
+      hash: "n/a",
+      reason: "host_module_resolution_failed",
+    });
+    return;
+  }
+
+  for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses"]) {
+    const provider = hostPiAi.getApiProvider(api);
+    if (provider && installed.__gsdHintsProviderCacheWrappers.get(api) === provider) continue;
+
+    if (!provider) {
+      logLifecycle("host_provider_registry_skip", {
+        boundary: "factory_registered",
+        source: api,
+        hash: "n/a",
+        reason: "api_provider_not_registered",
+      });
+      continue;
+    }
+
+    const wrapper = {
+      api,
+      stream: (model: any, context: any, options?: any) =>
+        provider.stream(model, context, withPromptCachePayloadRebalancer(options, model)),
+      streamSimple: (model: any, context: any, options?: any) =>
+        provider.streamSimple(model, context, withPromptCachePayloadRebalancer(options, model)),
+    };
+
+    hostPiAi.registerApiProvider(wrapper, `${PLUGIN}:prompt-cache-key`);
+
+    installed.__gsdHintsProviderCacheWrappers.set(api, wrapper);
+    logLifecycle("host_provider_prompt_cache_wrapper_installed", {
+      boundary: "factory_registered",
+      source: api,
+      hash: "n/a",
+      reason: "api_provider_wrapped",
+    });
+  }
+}
+
 export default async function registerExtension(pi: ExtensionAPI) {
+  await installHostProviderPromptCacheWrappers();
+
   logLifecycle("factory_registered", {
     reason: "extension_factory_initialized",
     boundary: "session_start",

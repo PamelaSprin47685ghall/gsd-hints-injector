@@ -98,9 +98,16 @@ This is deliberately based on upstream usage telemetry, not local prompt hashes.
 
 ## Provider Cache Key Rebalancing
 
-For OpenAI Responses-compatible payloads, the extension also rewrites provider `prompt_cache_key` values at the `before_provider_request` boundary. GSD's built-in OpenAI Responses providers populate that key from the per-session UUID, which prevents first-turn cache reads across separate conversations even when the stable system prompt is identical.
+For OpenAI Responses-compatible payloads, the extension rewrites provider `prompt_cache_key` values before the upstream request is sent. GSD's built-in OpenAI Responses providers populate that key from the per-session UUID, which prevents first-turn cache reads across separate conversations even when the stable system prompt is identical.
 
-The plugin replaces that session-scoped key with `gsd-hints-<hash>`, where the hash is derived from provider, API, model ID, and the stable system prompt extracted from `payload.input[0]` (`system`/`developer`) or `payload.instructions`. This applies to OpenAI, Azure OpenAI Responses, and Codex-style Responses payloads when they expose a string `prompt_cache_key`. Anthropic payloads use `cache_control` instead of `prompt_cache_key`, so they are left untouched.
+Two paths are installed:
+
+- `before_provider_request` keeps SDK/headless agents on the public extension event path.
+- A host API-provider wrapper resolves the running GSD process' `@gsd/pi-ai`, captures the currently registered `openai-responses`, `azure-openai-responses`, and `openai-codex-responses` providers, and composes their `onPayload` callback. This covers interactive `AgentSession` paths that currently bypass `before_provider_request`.
+
+The plugin replaces the session-scoped key with `gsd-hints-<hash>`, where the hash is derived from provider, API, model ID, and the stable system prompt extracted from `payload.input[0]` (`system`/`developer`) or `payload.instructions`. Anthropic payloads use `cache_control` instead of `prompt_cache_key`, so they are left untouched.
+
+If the host registry cannot be resolved, the extension logs `host_provider_registry_unavailable` and keeps the public event hook active.
 
 ## Diagnostics
 
@@ -117,6 +124,8 @@ Important phases:
 - `dynamic_prompt_context_sent`
 - `dynamic_prompt_context_skip`
 - `provider_cache_status`
+- `host_provider_prompt_cache_wrapper_installed`
+- `host_provider_registry_unavailable`
 - `provider_prompt_cache_key_rebalanced`
 - `hints_source_deduped`
 - `hints_truncated`
@@ -133,8 +142,8 @@ rg -n "before_agent_start|SYSTEM_HINTS_START|prompt-dynamic-context|Current date
 # 3) provider cache footer status path is wired from assistant usage
 rg -n "message_end|cache hit|cache warm|cache no-read|provider_cache_status|setStatus" index.ts
 
-# 4) provider request hook stabilizes OpenAI Responses prompt cache keys
-rg -n "before_provider_request|prompt_cache_key|extractStablePromptFromPayload|provider_prompt_cache_key_rebalanced" index.ts
+# 4) provider request paths stabilize OpenAI Responses prompt cache keys
+rg -n "before_provider_request|installHostProviderPromptCacheWrappers|registerApiProvider|prompt_cache_key|provider_prompt_cache_key_rebalanced" index.ts
 
 # 5) verify HINTS are not sent as visible boundary spam anymore
 rg -n "sendMessage|VISIBLE_HINTS_HEADER|conversation_inject_sent" index.ts && exit 1 || true
@@ -144,5 +153,5 @@ Pass criteria:
 - Each command exits `0`.
 - Step (2) matches the prompt split implementation markers.
 - Step (3) matches the provider cache status implementation markers.
-- Step (4) matches the provider payload cache key rebalance markers.
+- Step (4) matches both provider payload rebalance paths.
 - Step (5) returns no matches (no visible HINTS boundary spam path).

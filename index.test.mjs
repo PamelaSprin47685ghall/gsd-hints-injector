@@ -66,6 +66,20 @@ test("stabilizes OpenAI Responses prompt cache keys at provider payload boundary
   assert.match(source, /provider_prompt_cache_key_rebalanced/);
 });
 
+test("wraps host OpenAI API providers for interactive AgentSession payloads", () => {
+  assert.match(source, /resolveHostPiAiSpecifiers/);
+  assert.match(source, /node_modules", "@gsd", "pi-ai", "dist", "index\.js"/);
+  assert.match(source, /packages", "pi-ai", "dist", "index\.js"/);
+  assert.match(source, /installHostProviderPromptCacheWrappers/);
+  assert.match(source, /getApiProvider\(api\)/);
+  assert.match(source, /registerApiProvider/);
+  assert.match(source, /withPromptCachePayloadRebalancer/);
+  assert.match(source, /openai-responses/);
+  assert.match(source, /azure-openai-responses/);
+  assert.match(source, /openai-codex-responses/);
+  assert.match(source, /host_provider_prompt_cache_wrapper_installed/);
+});
+
 test("emits structured diagnostics with unified and prompt-split-specific fields", () => {
   assert.match(source, /plugin:\s*PLUGIN/);
   assert.match(source, /phase,/);
