@@ -2,9 +2,15 @@
   "id": "hints-injector",
   "name": "Hints Injector",
   "version": "1.0.0",
-  "description": "Injects stable HINTS.md guidance into systemPrompt and moves dynamic date/cwd context into hidden prompt messages for cache-friendly sessions.",
+  "description": "Injects stable HINTS.md guidance into systemPrompt, moves dynamic date/cwd context into hidden prompt messages, and stabilizes OpenAI Responses payload identifiers for cache-friendly sessions.",
   "tier": "community",
   "requires": {
     "platform": "any"
+  },
+  "dependencies": {
+    "runtime": ["node:crypto", "node:fs", "node:os", "node:path"]
+  },
+  "provides": {
+    "hooks": ["before_agent_start", "before_provider_request"]
   }
 }
