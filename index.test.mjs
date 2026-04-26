@@ -14,39 +14,43 @@ test("uses stateless before_agent_start prompt shaping instead of session-bounda
   assert.doesNotMatch(source, /pi\.on\("session_compact"/);
 });
 
-test("moves stable HINTS into systemPrompt with explicit static markers", () => {
+test("keeps HINTS injection as its own systemPrompt transform", () => {
   assert.match(source, /SYSTEM_HINTS_START/);
   assert.match(source, /SYSTEM_HINTS_END/);
   assert.match(source, /STATIC_HINTS_SYSTEM_HEADER/);
   assert.match(source, /buildStaticHintsSystemSection/);
+  assert.match(source, /function injectHintsIntoSystemPrompt/);
   assert.match(source, /static_hints_in_system_prompt/);
 });
 
-test("moves dynamic date and cwd lines out of systemPrompt", () => {
+test("moves dynamic systemPrompt lines into a hidden user message independently of API family", () => {
   assert.match(source, /DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS/);
   assert.match(source, /Current date and time:/);
   assert.match(source, /Current working directory:/);
   assert.match(source, /splitSystemPromptForCache/);
-  assert.match(source, /dynamic_lines_removed/);
+  assert.match(source, /function prepareSystemPrompt/);
+  assert.match(source, /customType: "prompt-dynamic-context"/);
+  assert.match(source, /system_prompt_dynamic_context_as_user_message/);
+  assert.doesNotMatch(source, /!isResponsesApi\(ctx\.model\)/);
+  assert.doesNotMatch(source, /function isResponsesApi/);
 });
 
-test("injects dynamic context at provider payload boundary for Responses APIs", () => {
+test("normalizes Responses payload dynamic context at the provider boundary", () => {
   assert.match(source, /function shapeProviderPayload/);
   assert.match(source, /before_provider_request/);
   assert.match(source, /buildResponsesDynamicContextItem/);
   assert.match(source, /extractDynamicPromptContextFromItem/);
   assert.match(source, /containsManagedSystemPrompt/);
   assert.match(source, /actual_outbound_payload_shaped/);
-  assert.match(source, /isResponsesApi/);
 });
 
-test("keeps Responses dynamic context at payload boundary and non-Responses via custom messages", () => {
-  assert.match(source, /customType: "prompt-dynamic-context"/);
-  assert.match(source, /non_responses_provider_prompt_message/);
-  assert.match(source, /!isResponsesApi\(ctx\.model\)/);
-  assert.match(source, /rememberOfficialDynamicContext/);
-  assert.match(source, /getOfficialDynamicContext/);
-  assert.match(source, /promptMaterialFound/);
+test("stabilizes Responses payload identifiers from the stable prompt", () => {
+  assert.match(source, /prompt_cache_key/);
+  assert.match(source, /extractStablePromptFromPayload/);
+  assert.match(source, /buildStablePayloadCacheKey/);
+  assert.match(source, /stabilizeResponsesPayloadIdentifiers/);
+  assert.match(source, /provider_prompt_cache_key_rebalanced/);
+  assert.match(source, /stable_payload_identifier/);
 });
 
 test("never fabricates runtime prompt dynamic context", () => {
@@ -55,17 +59,13 @@ test("never fabricates runtime prompt dynamic context", () => {
   assert.doesNotMatch(source, /toLocaleString\("en-US"/);
 });
 
-test("stabilizes OpenAI Responses prompt cache keys from shaped outbound payload", () => {
-  assert.match(source, /prompt_cache_key/);
-  assert.match(source, /extractStablePromptFromPayload/);
-  assert.match(source, /buildStablePromptCacheKey/);
-  assert.match(source, /provider_prompt_cache_key_rebalanced/);
-});
-
-test("wraps host providers idempotently after upstream registry wrapping", () => {
+test("wraps host Responses providers idempotently after upstream registry wrapping", () => {
   assert.match(source, /installHostProviderPromptWrappers/);
   assert.match(source, /getApiProvider\(api\)/);
   assert.match(source, /registerApiProvider/);
+  assert.match(source, /openai-responses/);
+  assert.match(source, /azure-openai-responses/);
+  assert.match(source, /openai-codex-responses/);
   assert.match(source, /const registeredProvider = hostPiAi\.getApiProvider\(api\)/);
   assert.match(source, /__gsdHintsProviderWrappers\.set\(api, registeredProvider\)/);
   assert.match(source, /host_provider_prompt_wrapper_installed/);

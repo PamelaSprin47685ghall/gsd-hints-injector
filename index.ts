@@ -281,14 +281,17 @@ function splitSystemPromptForCache(systemPrompt: string): SystemPromptSplit {
   };
 }
 
-function applyStaticPromptRebalance(systemPrompt: string, resolved: ResolvedHints): SystemPromptSplit {
-  const split = splitSystemPromptForCache(systemPrompt);
-  const withoutPriorHints = removeExistingStaticHints(split.staticSystemPrompt);
+function injectHintsIntoSystemPrompt(systemPrompt: string, resolved: ResolvedHints): string {
+  const withoutPriorHints = removeExistingStaticHints(systemPrompt);
   const staticHints = buildStaticHintsSystemSection(resolved);
+  return staticHints ? `${withoutPriorHints}\n\n${staticHints}`.trimEnd() : withoutPriorHints;
+}
 
+function prepareSystemPrompt(systemPrompt: string, resolved: ResolvedHints): SystemPromptSplit {
+  const split = splitSystemPromptForCache(systemPrompt);
   return {
     ...split,
-    staticSystemPrompt: staticHints ? `${withoutPriorHints}\n\n${staticHints}`.trimEnd() : withoutPriorHints,
+    staticSystemPrompt: injectHintsIntoSystemPrompt(split.staticSystemPrompt, resolved),
   };
 }
 
@@ -397,7 +400,7 @@ function extractStablePromptFromPayload(payload: Record<string, unknown>): strin
   return isRecord(first) ? extractTextContent(first.content) : undefined;
 }
 
-function buildStablePromptCacheKey(model: ProviderModelLike | undefined, stablePrompt: string): string {
+function buildStablePayloadCacheKey(model: ProviderModelLike | undefined, stablePrompt: string): string {
   return `gsd-hints-${hashText([model?.provider || "unknown", model?.api || "unknown", model?.id || "unknown", stablePrompt].join("\n"))}`;
 }
 
@@ -451,6 +454,29 @@ function containsManagedSystemPrompt(text: string): boolean {
   return text.includes(SYSTEM_HINTS_START) || DYNAMIC_SYSTEM_PROMPT_LINE_PATTERNS.some(({ pattern }) => pattern.test(text));
 }
 
+function stabilizeResponsesPayloadIdentifiers(
+  payload: Record<string, unknown>,
+  nextPayload: Record<string, unknown>,
+  model: ProviderModelLike | undefined,
+  stablePrompt: string | undefined,
+  promptMaterialFound: boolean,
+): boolean {
+  if (typeof payload.prompt_cache_key !== "string" || !stablePrompt || !promptMaterialFound) return false;
+
+  const nextCacheKey = buildStablePayloadCacheKey(model, stablePrompt);
+  if (payload.prompt_cache_key === nextCacheKey) return false;
+
+  nextPayload.prompt_cache_key = nextCacheKey;
+  logLifecycle("provider_prompt_cache_key_rebalanced", {
+    boundary: "before_provider_request",
+    source: model?.provider || "unknown",
+    hash: hashText(stablePrompt),
+    reason: "stable_payload_identifier",
+    detail: `api=${model?.api || "unknown"};model=${model?.id || "unknown"}`,
+  });
+  return true;
+}
+
 function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undefined, projectRoot: string): unknown | undefined {
   if (!isRecord(payload)) return undefined;
 
@@ -465,7 +491,7 @@ function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undef
     if (!text || !containsManagedSystemPrompt(text)) return value;
 
     promptMaterialFound = true;
-    const split = applyStaticPromptRebalance(text, resolved);
+    const split = prepareSystemPrompt(text, resolved);
     if (split.dynamicContext) dynamicContexts.push(split.dynamicContext);
     if (split.staticSystemPrompt === text) return value;
 
@@ -515,20 +541,7 @@ function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undef
   }
 
   const stablePrompt = extractStablePromptFromPayload(nextPayload);
-  if (typeof payload.prompt_cache_key === "string" && stablePrompt && promptMaterialFound) {
-    const nextCacheKey = buildStablePromptCacheKey(model, stablePrompt);
-    if (payload.prompt_cache_key !== nextCacheKey) {
-      nextPayload.prompt_cache_key = nextCacheKey;
-      changed = true;
-      logLifecycle("provider_prompt_cache_key_rebalanced", {
-        boundary: "before_provider_request",
-        source: model?.provider || "unknown",
-        hash: hashText(stablePrompt),
-        reason: "stable_system_prompt_key",
-        detail: `api=${model?.api || "unknown"};model=${model?.id || "unknown"}`,
-      });
-    }
-  }
+  changed = stabilizeResponsesPayloadIdentifiers(payload, nextPayload, model, stablePrompt, promptMaterialFound) || changed;
 
   if (changed) {
     logHintMaterialization("before_provider_request", resolved);
@@ -541,10 +554,6 @@ function shapeProviderPayload(payload: unknown, model: ProviderModelLike | undef
   }
 
   return changed ? nextPayload : undefined;
-}
-
-function isResponsesApi(model: ProviderModelLike | undefined): boolean {
-  return model?.api === "openai-responses" || model?.api === "azure-openai-responses" || model?.api === "openai-codex-responses";
 }
 
 function isHostPiAiModule(value: unknown): value is HostPiAiModule {
@@ -690,7 +699,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
     const resolved = resolveHints(ctx.cwd);
     logHintMaterialization("before_agent_start", resolved);
 
-    const split = applyStaticPromptRebalance(event.systemPrompt, resolved);
+    const split = prepareSystemPrompt(event.systemPrompt, resolved);
     rememberOfficialDynamicContext(ctx.cwd, split.dynamicContext);
     const result: { systemPrompt?: string; message?: { customType: string; content: string; display: boolean; details?: unknown } } = {};
 
@@ -705,7 +714,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
       });
     }
 
-    if (split.dynamicContext && !isResponsesApi(ctx.model)) {
+    if (split.dynamicContext) {
       const dynamicHash = hashText(split.dynamicContext);
       result.message = {
         customType: "prompt-dynamic-context",
@@ -722,7 +731,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
         boundary: "before_agent_start",
         source: "system_prompt_dynamic_lines",
         hash: dynamicHash,
-        reason: "non_responses_provider_prompt_message",
+        reason: "system_prompt_dynamic_context_as_user_message",
       });
     }
 
