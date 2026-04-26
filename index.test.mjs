@@ -55,6 +55,17 @@ test("emits provider cache telemetry to footer status from assistant usage", () 
   assert.match(source, /provider_cache_status/);
 });
 
+test("stabilizes OpenAI Responses prompt cache keys at provider payload boundary", () => {
+  assert.match(source, /pi\.on\("before_provider_request"/);
+  assert.match(source, /rebalanceProviderPromptCacheKey/);
+  assert.match(source, /prompt_cache_key/);
+  assert.match(source, /extractStablePromptFromPayload/);
+  assert.match(source, /buildStablePromptCacheKey/);
+  assert.match(source, /payload\.instructions/);
+  assert.match(source, /first\.role !== "system" && first\.role !== "developer"/);
+  assert.match(source, /provider_prompt_cache_key_rebalanced/);
+});
+
 test("emits structured diagnostics with unified and prompt-split-specific fields", () => {
   assert.match(source, /plugin:\s*PLUGIN/);
   assert.match(source, /phase,/);

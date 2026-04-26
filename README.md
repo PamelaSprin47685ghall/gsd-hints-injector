@@ -96,6 +96,12 @@ After each assistant response, the extension reads provider-reported `usage.cach
 
 This is deliberately based on upstream usage telemetry, not local prompt hashes. Local hashes can show whether the system prompt is stable and cache-friendly, but they cannot prove provider-side cache hits.
 
+## Provider Cache Key Rebalancing
+
+For OpenAI Responses-compatible payloads, the extension also rewrites provider `prompt_cache_key` values at the `before_provider_request` boundary. GSD's built-in OpenAI Responses providers populate that key from the per-session UUID, which prevents first-turn cache reads across separate conversations even when the stable system prompt is identical.
+
+The plugin replaces that session-scoped key with `gsd-hints-<hash>`, where the hash is derived from provider, API, model ID, and the stable system prompt extracted from `payload.input[0]` (`system`/`developer`) or `payload.instructions`. This applies to OpenAI, Azure OpenAI Responses, and Codex-style Responses payloads when they expose a string `prompt_cache_key`. Anthropic payloads use `cache_control` instead of `prompt_cache_key`, so they are left untouched.
+
 ## Diagnostics
 
 Lifecycle diagnostics are emitted as structured JSON with unified fields:
@@ -111,6 +117,7 @@ Important phases:
 - `dynamic_prompt_context_sent`
 - `dynamic_prompt_context_skip`
 - `provider_cache_status`
+- `provider_prompt_cache_key_rebalanced`
 - `hints_source_deduped`
 - `hints_truncated`
 
@@ -126,7 +133,10 @@ rg -n "before_agent_start|SYSTEM_HINTS_START|prompt-dynamic-context|Current date
 # 3) provider cache footer status path is wired from assistant usage
 rg -n "message_end|cache hit|cache warm|cache no-read|provider_cache_status|setStatus" index.ts
 
-# 4) verify HINTS are not sent as visible boundary spam anymore
+# 4) provider request hook stabilizes OpenAI Responses prompt cache keys
+rg -n "before_provider_request|prompt_cache_key|extractStablePromptFromPayload|provider_prompt_cache_key_rebalanced" index.ts
+
+# 5) verify HINTS are not sent as visible boundary spam anymore
 rg -n "sendMessage|VISIBLE_HINTS_HEADER|conversation_inject_sent" index.ts && exit 1 || true
 ```
 
@@ -134,4 +144,5 @@ Pass criteria:
 - Each command exits `0`.
 - Step (2) matches the prompt split implementation markers.
 - Step (3) matches the provider cache status implementation markers.
-- Step (4) returns no matches (no visible HINTS boundary spam path).
+- Step (4) matches the provider payload cache key rebalance markers.
+- Step (5) returns no matches (no visible HINTS boundary spam path).

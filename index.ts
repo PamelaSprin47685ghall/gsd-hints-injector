@@ -74,6 +74,12 @@ interface AssistantMessageLike {
   usage?: UsageLike;
 }
 
+interface ProviderModelLike {
+  provider?: string;
+  id?: string;
+  api?: string;
+}
+
 const state: RuntimeState = {
   skipNextNewSwitchDynamicInjection: false,
   agentStartedAfterSessionStart: false,
@@ -402,6 +408,73 @@ function updateCacheStatus(message: unknown): void {
   });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function extractTextContent(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return undefined;
+
+  const text = value
+    .map((part) => {
+      if (!isRecord(part)) return "";
+      const type = part.type;
+      return (type === "input_text" || type === "text") && typeof part.text === "string" ? part.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  return text || undefined;
+}
+
+function extractStablePromptFromPayload(payload: Record<string, unknown>): string | undefined {
+  const instructions = extractTextContent(payload.instructions);
+  if (instructions) return instructions;
+
+  const input = payload.input;
+  if (!Array.isArray(input)) return undefined;
+
+  const first = input[0];
+  if (!isRecord(first)) return undefined;
+  if (first.role !== "system" && first.role !== "developer") return undefined;
+
+  return extractTextContent(first.content);
+}
+
+function buildStablePromptCacheKey(model: ProviderModelLike | undefined, stablePrompt: string): string {
+  const material = [
+    model?.provider || "unknown",
+    model?.api || "unknown",
+    model?.id || "unknown",
+    stablePrompt,
+  ].join("\n");
+  return `gsd-hints-${hashText(material)}`;
+}
+
+function rebalanceProviderPromptCacheKey(payload: unknown, model: ProviderModelLike | undefined): unknown | undefined {
+  if (!isRecord(payload) || typeof payload.prompt_cache_key !== "string") return undefined;
+
+  const stablePrompt = extractStablePromptFromPayload(payload);
+  if (!stablePrompt) return undefined;
+
+  const nextCacheKey = buildStablePromptCacheKey(model, stablePrompt);
+  if (payload.prompt_cache_key === nextCacheKey) return undefined;
+
+  logLifecycle("provider_prompt_cache_key_rebalanced", {
+    boundary: "before_provider_request",
+    source: model?.provider || "unknown",
+    hash: hashText(stablePrompt),
+    reason: "stable_system_prompt_key",
+    detail: `api=${model?.api || "unknown"};model=${model?.id || "unknown"}`,
+  });
+
+  return {
+    ...payload,
+    prompt_cache_key: nextCacheKey,
+  };
+}
+
 export default async function registerExtension(pi: ExtensionAPI) {
   logLifecycle("factory_registered", {
     reason: "extension_factory_initialized",
@@ -435,6 +508,11 @@ export default async function registerExtension(pi: ExtensionAPI) {
   pi.on("message_end", (event: any, ctx) => {
     bindUiControls(ctx);
     updateCacheStatus(event.message);
+  });
+
+  pi.on("before_provider_request", (event: any, ctx) => {
+    bindUiControls(ctx);
+    return rebalanceProviderPromptCacheKey(event.payload, event.model);
   });
 
   // Session switch: a new auto-mode unit may rebuild cwd/date in the base prompt.
