@@ -9,6 +9,14 @@ test("registers lifecycle boundaries for prompt rebalancing", () => {
   assert.match(source, /pi\.on\("session_switch"/);
   assert.match(source, /pi\.on\("agent_start"/);
   assert.match(source, /pi\.on\("before_agent_start"/);
+  assert.match(source, /pi\.on\("session_compact"/);
+});
+
+test("marks dynamic prompt context pending again after compaction", () => {
+  assert.match(source, /pi\.on\("session_compact"/);
+  assert.match(source, /boundary: "session_compact"/);
+  assert.match(source, /dynamic_context_pending_after_compact/);
+  assert.match(source, /state\.pendingDynamicPromptContext = true/);
 });
 
 test("gates session_switch dynamic context to reason=new with bootstrap duplicate suppression", () => {

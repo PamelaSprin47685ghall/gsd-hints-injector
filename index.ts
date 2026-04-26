@@ -20,7 +20,7 @@ const DYNAMIC_CONTEXT_MESSAGE_HEADER = `Prompt Dynamic Context
 The following values were intentionally moved out of systemPrompt so provider-side system prompt caching can reuse the stable instructions.`;
 
 type HintSource = "global" | "project";
-type LifecycleBoundary = "session_start" | "session_switch:new" | "before_agent_start";
+type LifecycleBoundary = "session_start" | "session_switch:new" | "session_compact" | "before_agent_start";
 
 interface HintSegment {
   source: HintSource;
@@ -628,6 +628,16 @@ export default async function registerExtension(pi: ExtensionAPI) {
   pi.on("before_provider_request", (event: any, ctx) => {
     bindUiControls(ctx);
     return rebalanceProviderPromptCacheKey(event.payload, event.model);
+  });
+
+  pi.on("session_compact", (_event, ctx) => {
+    bindUiControls(ctx);
+    state.pendingDynamicPromptContext = true;
+
+    logLifecycle("prompt_rebalance_boundary", {
+      boundary: "session_compact",
+      reason: "dynamic_context_pending_after_compact",
+    });
   });
 
   // Session switch: a new auto-mode unit may rebuild cwd/date in the base prompt.

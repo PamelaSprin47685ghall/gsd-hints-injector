@@ -57,6 +57,7 @@ Relevant source paths in `../gsd-2`:
 - `session_start` → marks the next agent turn as needing a dynamic prompt-context message.
 - `session_switch` (`reason === "new"`) → marks the next agent turn as needing fresh dynamic prompt context for new auto-mode unit sessions.
   - If a `session_switch:new` immediately follows `session_start` before any agent turn, it is treated as bootstrap duplicate and suppressed once.
+- `session_compact` → marks the next agent turn as needing fresh dynamic prompt context because compaction replaces message history and may fold away the prior hidden dynamic message.
 - `before_agent_start` → performs the actual split:
   - strips dynamic date/cwd lines from `systemPrompt`,
   - appends static HINTS to `systemPrompt`,
@@ -119,6 +120,8 @@ Lifecycle diagnostics are emitted as structured JSON with unified fields:
 Important phases:
 
 - `prompt_rebalance_boundary`
+  - `reason=dynamic_context_pending`
+  - `reason=dynamic_context_pending_after_compact`
 - `prompt_rebalance_boundary_skip`
 - `system_prompt_rebalanced`
 - `dynamic_prompt_context_sent`
@@ -137,7 +140,7 @@ Important phases:
 node --test index.test.mjs
 
 # 2) prompt split markers
-rg -n "before_agent_start|SYSTEM_HINTS_START|prompt-dynamic-context|Current date and time|Current working directory" index.ts
+rg -n "before_agent_start|session_compact|SYSTEM_HINTS_START|prompt-dynamic-context|Current date and time|Current working directory" index.ts
 
 # 3) provider cache footer status path is wired from assistant usage
 rg -n "message_end|cache hit|cache warm|cache no-read|provider_cache_status|setStatus" index.ts
