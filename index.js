@@ -44,9 +44,11 @@ export function buildBeforeAgentStartResult(systemPrompt) {
 
 /**
  * Insert an assistant "收到，我将用中文思考和回复你。" between consecutive user/custom messages.
- * Some LLMs don't like consecutive user messages; this ensures alternating roles.
+ * Only acts when at least one message in the pair was injected by this plugin
+ * (customType === "gsd-hints-dynamic-context").
  */
 export function fixConsecutiveUserMessages(messages) {
+  const hasOurMsg = (msg) => msg?.role === "custom" && msg?.customType === "gsd-hints-dynamic-context";
   let changed = false;
   const next = [];
   for (let i = 0; i < messages.length; i++) {
@@ -55,7 +57,7 @@ export function fixConsecutiveUserMessages(messages) {
     if (nxt) {
       const curIsUser = messages[i]?.role === "user" || messages[i]?.role === "custom";
       const nxtIsUser = nxt?.role === "user" || nxt?.role === "custom";
-      if (curIsUser && nxtIsUser) {
+      if (curIsUser && nxtIsUser && (hasOurMsg(messages[i]) || hasOurMsg(nxt))) {
         next.push({ role: "assistant", content: [{ type: "text", text: "收到，我将用中文思考和回复你。" }] });
         changed = true;
       }

@@ -148,3 +148,20 @@ test("fixConsecutiveUserMessages returns undefined on empty or single message", 
   assert.equal(fixConsecutiveUserMessages([]), undefined);
   assert.equal(fixConsecutiveUserMessages([{ role: "user", content: "hi" }]), undefined);
 });
+
+test("fixConsecutiveUserMessages ignores consecutive user messages not involving our plugin", () => {
+  const msgs = [
+    { role: "user", content: "hello" },
+    { role: "user", content: "again" },
+  ];
+  assert.equal(fixConsecutiveUserMessages(msgs), undefined);
+});
+
+test("fixConsecutiveUserMessages ignores custom messages from other plugins", () => {
+  const msgs = [
+    { role: "custom", customType: "other-plugin-type", content: "foo" },
+    { role: "user", content: "bar" },
+    { role: "custom", customType: "yet-another", content: "baz" },
+  ];
+  assert.equal(fixConsecutiveUserMessages(msgs), undefined);
+});
