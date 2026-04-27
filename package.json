@@ -1,6 +1,6 @@
 {
   "name": "gsd-hints-injector",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Injects HINTS.md into systemPrompt and moves dynamic prompt lines out for cacheability.",
   "type": "module",
   "exports": "./index.js",
@@ -11,8 +11,6 @@
     "extension": true
   },
   "pi": {
-    "extensions": [
-      "index.js"
-    ]
+    "extensions": ["index.js"]
   }
 }
