@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import hintsInjector, { buildBeforeAgentStartResult, loadHintSources, stabilizeResponsesInput, stabilizeResponsesPayload } from "./index.js";
+import hintsInjector, { buildBeforeAgentStartResult, loadHintSources, stabilizeResponsesInput, stabilizeResponsesPayload, fixConsecutiveUserMessages } from "./index.js";
 
 const withTmp = (fn) => {
   const d = mkdtempSync(join(tmpdir(), "gsd-"));
@@ -20,6 +20,7 @@ test("registers lifecycle hooks", () => {
   const h = new Map();
   hintsInjector({ on: (e, cb) => h.set(e, cb) });
   assert.equal(typeof h.get("before_agent_start"), "function");
+  assert.equal(typeof h.get("context"), "function");
   assert.equal(typeof h.get("before_provider_request"), "function");
 });
 
@@ -104,4 +105,46 @@ test("stabilizes response input arrays safely", () => {
 test("ignores non-Responses provider payloads", () => {
   const r = stabilizeResponsesPayload({ payload: { messages: [] }, model: { api: "anthropic-messages" } });
   assert.equal(r, undefined);
+});
+
+test("fixConsecutiveUserMessages inserts 收到 between user and custom", () => {
+  const msgs = [
+    { role: "system", content: "be helpful" },
+    { role: "user", content: "hello" },
+    { role: "custom", customType: "gsd-hints-dynamic-context", content: "cwd: /tmp" },
+  ];
+  const r = fixConsecutiveUserMessages(msgs);
+  assert.ok(r);
+  assert.equal(r[1].role, "user");
+  assert.equal(r[2].role, "assistant");
+  assert.equal(r[2].content, "收到");
+  assert.equal(r[3].role, "custom");
+});
+
+test("fixConsecutiveUserMessages inserts 收到 between custom and user", () => {
+  const msgs = [
+    { role: "system", content: "be helpful" },
+    { role: "custom", customType: "gsd-hints-dynamic-context", content: "cwd: /tmp" },
+    { role: "user", content: "hello" },
+  ];
+  const r = fixConsecutiveUserMessages(msgs);
+  assert.ok(r);
+  assert.equal(r[1].role, "custom");
+  assert.equal(r[2].role, "assistant");
+  assert.equal(r[2].content, "收到");
+  assert.equal(r[3].role, "user");
+});
+
+test("fixConsecutiveUserMessages does nothing on alternating roles", () => {
+  const msgs = [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+    { role: "user", content: "again" },
+  ];
+  assert.equal(fixConsecutiveUserMessages(msgs), undefined);
+});
+
+test("fixConsecutiveUserMessages returns undefined on empty or single message", () => {
+  assert.equal(fixConsecutiveUserMessages([]), undefined);
+  assert.equal(fixConsecutiveUserMessages([{ role: "user", content: "hi" }]), undefined);
 });

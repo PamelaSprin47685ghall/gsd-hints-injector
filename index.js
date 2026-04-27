@@ -5,13 +5,17 @@ import { join } from "node:path";
 
 export default function hintsInjector(pi) {
   pi.on("before_agent_start", (e) => buildBeforeAgentStartResult(e.systemPrompt));
+  pi.on("context", (e) => {
+    const fixed = fixConsecutiveUserMessages(e.messages);
+    if (fixed) return { messages: fixed };
+  });
   pi.on("before_provider_request", stabilizeResponsesPayload);
 }
 
 export function buildBeforeAgentStartResult(systemPrompt) {
   let cwd = "";
   const dynLines = [], keptLines = [];
-  
+
   for (const line of systemPrompt.split("\n")) {
     if (/^Current (date|working directory)/.test(line)) {
       dynLines.push(line.trim());
@@ -24,7 +28,7 @@ export function buildBeforeAgentStartResult(systemPrompt) {
 
   const sources = loadHintSources(cwd);
   const hints = sources.length ? `[HINTS — Stable Guidance]\n\nThese instructions come from HINTS.md files and are intentionally injected into the stable system prompt.\n\n` + sources.map(s => `## ${s.label} HINTS (${s.path})\n\n${s.content}`).join("\n\n") : "";
-  
+
   const nextSys = keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
   const finalSys = hints ? `${nextSys}\n\n${hints}` : nextSys;
 
@@ -38,6 +42,28 @@ export function buildBeforeAgentStartResult(systemPrompt) {
   return { ...(finalSys !== systemPrompt && { systemPrompt: finalSys }), ...(msg && { message: msg }) };
 }
 
+/**
+ * Insert an assistant "收到，我将用中文思考和回复你。" between consecutive user/custom messages.
+ * Some LLMs don't like consecutive user messages; this ensures alternating roles.
+ */
+export function fixConsecutiveUserMessages(messages) {
+  let changed = false;
+  const next = [];
+  for (let i = 0; i < messages.length; i++) {
+    next.push(messages[i]);
+    const nxt = messages[i + 1];
+    if (nxt) {
+      const curIsUser = messages[i]?.role === "user" || messages[i]?.role === "custom";
+      const nxtIsUser = nxt?.role === "user" || nxt?.role === "custom";
+      if (curIsUser && nxtIsUser) {
+        next.push({ role: "assistant", content: "收到，我将用中文思考和回复你。" });
+        changed = true;
+      }
+    }
+  }
+  return changed ? next : undefined;
+}
+
 function read(p) {
   try { return existsSync(p) ? readFileSync(p, "utf8").trim() : ""; } catch { return ""; }
 }
@@ -47,7 +73,7 @@ export function loadHintSources(cwd) {
   const gPath = join(process.env.GSD_HOME || join(homedir(), ".gsd"), "HINTS.md");
   const g = read(gPath);
   if (g) s.push({ label: "Global", path: gPath, content: g });
-  
+
   if (cwd) {
     const p1 = join(cwd, ".gsd", "HINTS.md"), p2 = join(cwd, "HINTS.md");
     const c1 = read(p1), c2 = read(p2);
@@ -85,7 +111,7 @@ export function stabilizeResponsesPayload(event) {
 export function stabilizeResponsesInput(input) {
   const callMap = new Map();
   let m = 0, f = 0, changed = false;
-  
+
   const getCallId = (id) => {
     if (!callMap.has(id)) callMap.set(id, `call_${callMap.size}`);
     return callMap.get(id);
