@@ -117,7 +117,7 @@ test("fixConsecutiveUserMessages inserts 收到 between user and custom", () => 
   assert.ok(r);
   assert.equal(r[1].role, "user");
   assert.equal(r[2].role, "assistant");
-  assert.equal(r[2].content, "收到");
+  assert.deepEqual(r[2].content, [{ type: "text", text: "收到，我将用中文思考和回复你。" }]);
   assert.equal(r[3].role, "custom");
 });
 
@@ -131,7 +131,7 @@ test("fixConsecutiveUserMessages inserts 收到 between custom and user", () => 
   assert.ok(r);
   assert.equal(r[1].role, "custom");
   assert.equal(r[2].role, "assistant");
-  assert.equal(r[2].content, "收到");
+  assert.deepEqual(r[2].content, [{ type: "text", text: "收到，我将用中文思考和回复你。" }]);
   assert.equal(r[3].role, "user");
 });
 

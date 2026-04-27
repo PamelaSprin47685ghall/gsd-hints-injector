@@ -56,7 +56,7 @@ export function fixConsecutiveUserMessages(messages) {
       const curIsUser = messages[i]?.role === "user" || messages[i]?.role === "custom";
       const nxtIsUser = nxt?.role === "user" || nxt?.role === "custom";
       if (curIsUser && nxtIsUser) {
-        next.push({ role: "assistant", content: "收到，我将用中文思考和回复你。" });
+        next.push({ role: "assistant", content: [{ type: "text", text: "收到，我将用中文思考和回复你。" }] });
         changed = true;
       }
     }
